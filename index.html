@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>色彩渐变流动背景</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3CradialGradient id='g' cx='35%25' cy='30%25'%3E%3Cstop offset='0' stop-color='%23f2f2f2'/%3E%3Cstop offset='1' stop-color='%23222'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- 语言的真值源（视觉上的段控 #segLang 只是它的外观，见 app.js 的 bindSeg）。
+     与 particle-pointcloud 同一套做法：隐藏 select + .seg.lang-seg 外壳。 -->
+<select id="lang" hidden>
+  <option value="zh">中文</option>
+  <option value="en">English</option>
+</select>
+
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div id="hud"></div>
+</div>
+
+<!-- ============================ 左面板：颜色 ============================ -->
+<aside class="panel" id="panelL">
+  <div class="panel-head">
+    <h1 data-i18n="appTitleL">色彩渐变流动背景</h1>
+    <span class="sp"></span>
+    <div class="seg lang-seg" id="segLang" role="group" aria-label="语言 / Language" data-i18n-aria="langLabel">
+      <button type="button" data-val="zh" aria-pressed="true" title="中文">中</button>
+      <button type="button" data-val="en" aria-pressed="false" title="English">EN</button>
+    </div>
+    <button class="btn sm" id="collapseAll" data-i18n="collapse" data-i18n-title="tCollapse"
+            title="收起两侧面板（Tab）">收起</button>
+  </div>
+
+  <div class="body">
+    <!-- 01 取色 -->
+    <section class="open" data-sec="preset">
+      <button class="sec-head" type="button"><span class="no">01</span><span class="t" data-i18n="sPreset">配色预设</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div id="presets"></div>
+      </div>
+    </section>
+
+    <section class="open" data-sec="palette">
+      <button class="sec-head" type="button"><span class="no">02</span><span class="t" data-i18n="sBand">色带 · 取色点</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div id="bandWrap">
+          <div id="band"></div>
+          <div id="swatches"></div>
+        </div>
+        <div class="row" style="margin-top:16px">
+          <span class="lab" data-i18n="lEdited">已手动调整</span>
+          <span class="val mono" id="vEdited">0 / 12</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03 调色 -->
+    <section class="open" data-sec="grade">
+      <button class="sec-head" type="button"><span class="no">03</span><span class="t" data-i18n="sGrade">色彩调整</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div class="row"><span class="lab" data-i18n="lBri">明    度</span><span class="val" id="vBri">1.00</span></div>
+        <input type="range" id="bri" min="0.4" max="1.8" step="0.01" value="1">
+        <div class="row"><span class="lab" data-i18n="lCon">对 比 度</span><span class="val" id="vCon">1.00</span></div>
+        <input type="range" id="con" min="0.4" max="1.8" step="0.01" value="1">
+        <div class="row"><span class="lab" data-i18n="lSat">饱 和 度</span><span class="val" id="vSat">1.00</span></div>
+        <input type="range" id="sat" min="0" max="2" step="0.01" value="1">
+        <div class="row"><span class="lab" data-i18n="lHue">色    相</span><span class="val" id="vHueS">0°</span></div>
+        <input type="range" id="hueS" min="-180" max="180" step="1" value="0">
+      </div>
+    </section>
+
+  </div>
+</aside>
+
+<!-- ============================ 右面板：动态 ============================ -->
+<aside class="panel" id="panelR">
+  <div class="panel-head">
+    <h1 data-i18n="appTitleR">动态 · 输出</h1>
+    <span class="sp"></span>
+    <button class="btn sm" id="pause" data-i18n="pause" data-i18n-title="tPause" title="空格键播放 / 暂停">暂停</button>
+  </div>
+
+  <div class="toolbar">
+    <div class="row"><span class="lab" data-i18n="lQuality">渲染画质</span><span class="val mono" id="vQual">标准 · 1.0×</span></div>
+    <div class="seg" id="qSeg" role="group" aria-label="渲染画质" data-i18n-aria="lQuality">
+      <button data-q="0.6" data-i18n="qSmooth">流畅</button>
+      <button data-q="1" class="on" data-i18n="qStd">标准</button>
+      <button data-q="1.5" data-i18n="qHigh">高清</button>
+    </div>
+    <button class="btn" id="factory" data-i18n="factory" data-i18n-title="tFactory"
+            title="色带 / 调色 / 动态 / 质感 全部回到出厂默认">恢复出厂设置</button>
+  </div>
+
+  <div class="body">
+    <!-- 05 动态 -->
+    <section class="open" data-sec="motion">
+      <button class="sec-head" type="button"><span class="no">05</span><span class="t" data-i18n="sMotion">渐变动态</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div class="row"><span class="lab" data-i18n="lSpeed">速    度</span><span class="val" id="vSpeed">0.50</span></div>
+        <input type="range" id="speed" min="0" max="2" step="0.01" value="0.5">
+        <div class="row"><span class="lab" data-i18n="lSize">色块大小</span><span class="val" id="vSize">1.00</span></div>
+        <input type="range" id="size" min="0.45" max="3" step="0.01" value="1">
+        <div class="row"><span class="lab" data-i18n="lRnd">随 机 性</span><span class="val" id="vRnd">1.00</span></div>
+        <input type="range" id="rnd" min="0" max="1" step="0.01" value="1">
+        <div class="row">
+          <span class="lab" data-i18n="lCount">色块数量</span><span class="val mono" id="vCount">6</span>
+        </div>
+        <input type="range" id="count" min="2" max="10" step="1" value="6">
+        <div class="btn-row">
+          <button class="btn sm wide" id="reseed" data-i18n="reseed" data-i18n-title="tReseed"
+                  title="重新抽一次构图（换一套随机种子）">换一个构图</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06 质感 -->
+    <section class="open" data-sec="texture">
+      <button class="sec-head" type="button"><span class="no">06</span><span class="t" data-i18n="sTexture">质感 · 画面</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div class="row"><span class="lab" data-i18n="lGrain">颗    粒</span><span class="val" id="vGrain">1.00</span></div>
+        <input type="range" id="grain" min="0" max="1" step="0.01" value="1">
+        <div class="row"><span class="lab" data-i18n="lVin">暗    角</span><span class="val" id="vVin">0.00</span></div>
+        <input type="range" id="vin" min="0" max="1" step="0.01" value="0">
+        <div class="row"><span class="lab" data-i18n="lSoft">边缘柔和</span><span class="val" id="vSoft">0.10</span></div>
+        <input type="range" id="soft" min="0.1" max="2.5" step="0.01" value="0.1">
+        <div class="row"><span class="lab" data-i18n="lWarp">扭    曲</span><span class="val" id="vWarp">2.00</span></div>
+        <input type="range" id="warp" min="0" max="2" step="0.01" value="2">
+        <div class="row"><span class="lab" data-i18n="lGap">色块间隙</span><span class="val" id="vGap">0.00</span></div>
+        <input type="range" id="gap" min="0" max="1" step="0.01" value="0">
+      </div>
+    </section>
+
+    <!-- 07 玻璃（2026-09 用户要求：从 06 质感·画面 独立成区，并加一个总开关） -->
+    <section class="open" data-sec="glass">
+      <button class="sec-head" type="button"><span class="no">07</span><span class="t" data-i18n="sGlass">玻    璃</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div class="row"><span class="lab" data-i18n="lGlassSw">玻璃质感</span><button class="tgl on" id="glassSw" type="button" role="switch" aria-checked="true" aria-label="玻璃开关" data-i18n-aria="lGlassSw"><i></i></button></div>
+        <div class="row glassOnly" style="margin-top:14px"><span class="lab" data-i18n="lGlassType">玻璃类型</span><span class="val" id="vGlass">毛玻璃</span></div>
+        <div class="seg glassOnly" id="glassSeg" style="margin-top:6px" role="group" aria-label="玻璃类型" data-i18n-aria="lGlassType">
+          <button data-glass="0" class="on" data-i18n="gFrost">毛玻璃</button>
+          <button data-glass="1" data-i18n="gReeded">长虹</button>
+          <button data-glass="2" data-i18n="gPeel">橘皮</button>
+          <button data-glass="3" data-i18n="gWeave">布纹</button>
+          <button data-glass="4" data-i18n="gGrid">方格</button>
+        </div>
+        <div class="row glassOnly glassFrostOnly" style="margin-top:10px"><span class="lab" data-i18n="lFrostAmt">玻璃强度</span><span class="val" id="vFrost">0.60</span></div>
+        <input type="range" id="frost" class="glassOnly glassFrostOnly" min="0" max="1" step="0.01" value="0.6">
+        <div class="row glassOnly glassNonFrost" style="margin-top:10px"><span class="lab" data-i18n="lGlassSize">玻璃尺寸</span><span class="val" id="vGlassSize">1.00</span></div>
+        <input type="range" id="glassSize" class="glassOnly glassNonFrost" min="0.4" max="3" step="0.01" value="1">
+        <div class="row glassOnly glassNonFrost"><span class="lab" data-i18n="lGlassHi">玻璃高光</span><span class="val" id="vGlassHi">0.08</span></div>
+        <input type="range" id="glassHi" class="glassOnly glassNonFrost" min="0" max="1" step="0.01" value="0.08">
+      </div>
+    </section>
+
+    <!-- 08 渲染导出（2026-09 因为插入 07 玻璃而顺延） -->
+    <section data-sec="out">
+      <button class="sec-head" type="button"><span class="no">08</span><span class="t" data-i18n="sOut">渲染导出</span><span class="caret"></span></button>
+      <div class="sec-body">
+        <div class="row"><span class="lab" data-i18n="lContent">内    容</span></div>
+        <div class="seg" id="expMode" role="group" aria-label="导出内容" data-i18n-aria="lContent">
+          <button data-exp="anim" class="on" data-i18n="oSeq">序列</button>
+          <button data-exp="still" data-i18n="oStill">单帧</button>
+        </div>
+
+        <div class="animOnly">
+          <div class="row" style="margin-top:12px"><span class="lab" data-i18n="lDur">时    长</span><span class="val mono" id="vDur">6.0s</span></div>
+          <input type="range" id="dur" min="1" max="30" step="0.5" value="6">
+          <div class="row"><span class="lab" data-i18n="lFps">序列帧率</span></div>
+          <div class="seg" id="fpsSeg" role="group" aria-label="序列帧率" data-i18n-aria="lFps">
+            <button data-fps="24">24</button>
+            <button data-fps="30" class="on">30</button>
+            <button data-fps="60">60</button>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px"><span class="lab" data-i18n="lRes">分 辨 率</span><span class="val mono" id="vOutSize">1920×1080</span></div>
+        <div class="seg" id="sizeSeg" style="margin-top:6px" role="group" aria-label="分辨率" data-i18n-aria="lRes">
+          <button data-sz="1280x720">720p</button>
+          <button data-sz="1920x1080" class="on">1080p</button>
+          <button data-sz="2560x1440">1440p</button>
+          <button data-sz="1080x1920" data-i18n="oPortrait">竖屏</button>
+        </div>
+
+        <div class="btn-row"><button class="btn wide primary" id="btnExport" data-i18n="btnExportSeq">导出序列</button></div>
+        <div class="btn-row"><button class="btn wide" id="embed" data-i18n="embed">导出网页背景代码</button></div>
+
+      </div>
+    </section>
+  </div>
+</aside>
+
+<div id="toggleBtn" data-i18n="panelChip">‹ 显示面板 ›</div>
+
+<div id="recBar"><span class="dot"></span><span class="txt" id="recTxt">录制中 0.0 / 6.0s</span><button class="btn sm" id="recStop" data-i18n="recStop">停止</button></div>
+<div id="toast"></div>
+
+<!-- 内联取色器 -->
+<div id="picker">
+  <div id="pickHead">
+    <span id="pickChip"></span>
+    <input id="pickHex" type="text" spellcheck="false" maxlength="7">
+  </div>
+  <div id="sv"><canvas id="svC" width="170" height="110"></canvas><span id="svDot"></span></div>
+  <input id="hue" type="range" min="0" max="360" step="1" value="0">
+</div>
+
+<div id="modal">
+  <div class="sheet">
+    <header>
+      <h2 id="mTitle">导出</h2>
+      <span class="sp" style="flex:1"></span>
+      <button class="btn sm" id="mClose" data-i18n="mClose">关闭</button>
+    </header>
+    <div class="content" id="mBody"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

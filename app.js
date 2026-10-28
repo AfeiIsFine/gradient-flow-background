@@ -1,0 +1,2761 @@
+/* ============================================================================
+   渐变流动 Gradient Flow
+   单文件 WebGL2 实时渐变动画背景生成器 · 无任何外部依赖
+
+   架构：
+     颜色管线（CPU，只在颜色变化时重算）
+       取样线 → 512 点带宽加权采样 → rawCurve(sRGB)
+         → 12 个取色点偏移（sRGB 差值）
+           → 明度/对比度/饱和度/色相
+             → sRGB → linear → 512×1 LUT 纹理（NoColorSpace）
+     shader（GPU，每帧）
+       色块位置（噪声摆动的利萨如轨道）
+         → 高斯权重混合（weight^k 而不是 exp，数值稳定、无需归一化）
+           → 域扭曲（domain warp）把色团边缘揉成流动的手指状
+             → 基调压暗 → LUT 取色 → 曝光 → 暗角 → TPDF 颗粒抖动 → sRGB
+
+   为什么不用 three.js：这是单 draw call 的全屏着色器，three 只会多一层
+   CORS/加载/版本负担。纯 WebGL2 双击即可运行，离线可用。
+   ========================================================================== */
+'use strict';
+
+/* ============================================================ 0. 基础工具 */
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const fmt = (v, n) => v.toFixed(n);
+
+/* ============================================================ 0.5 语言（中 / EN）
+   与 particle-pointcloud 同一套做法（用户 2026-09 夜间任务指定"照它的实际实现方式，
+   不要另造一套交互"）：
+     · 静态文案：HTML 上标 data-i18n / data-i18n-title / data-i18n-aria，
+       applyLang() 一次性替换（textContent / title / aria-label 三个通道）；
+     · 动态文案（滑块读数、按钮状态、toast、玻璃类型名、预设名）：由 applyLang()
+       调用的 refresh* 系列重算；
+     · 偏好存 localStorage['gf.lang']；
+     · 隐藏的 <select id="lang"> 是唯一真值源，视觉上的 .seg.lang-seg 只是它的外观
+       （bindSeg 把点击转成 select 的 change，与 particle-pointcloud 完全一致）。
+   取名 tr 而不是 t：本文件里 t 到处是时间变量（着色器 / 动画 / 导出循环），tr 不会被遮蔽。 */
+const I18N = {
+  zh: {
+    docTitle: '色彩渐变流动背景',
+    appTitleL: '色彩渐变流动背景', appTitleR: '动态 · 输出',
+    collapse: '收起', panelChip: '‹ 显示面板 ›', langLabel: '语言 / Language',
+    pause: '暂停', play: '播放',
+    tCollapse: '收起两侧面板（Tab）', tPause: '空格键播放 / 暂停',
+    tFactory: '色带 / 调色 / 动态 / 质感 全部回到出厂默认', tReseed: '重新抽一次构图（换一套随机种子）',
+    sPreset: '配色预设', sBand: '色带 · 取色点', sGrade: '色彩调整', sMotion: '渐变动态',
+    sTexture: '质感 · 画面', sGlass: '玻璃', sOut: '渲染导出',
+    lBri: '明    度', lCon: '对 比 度', lSat: '饱 和 度', lHue: '色    相',
+    lEdited: '已手动调整',
+    lQuality: '渲染画质', qSmooth: '流畅', qStd: '标准', qHigh: '高清',
+    factory: '恢复出厂设置',
+    lSpeed: '速    度', lSize: '色块大小', lRnd: '随 机 性', lCount: '色块数量', reseed: '换一个构图',
+    lGrain: '颗    粒', lVin: '暗    角', lSoft: '边缘柔和', lWarp: '扭    曲', lGap: '色块间隙',
+    lGlassSw: '玻璃质感', lGlassType: '玻璃类型',
+    gFrost: '毛玻璃', gReeded: '长虹', gPeel: '橘皮', gWeave: '布纹', gGrid: '方格',
+    lFrostAmt: '玻璃强度', lGlassSize: '玻璃尺寸', lGlassHi: '玻璃高光',
+    lContent: '内    容', oSeq: '序列', oStill: '单帧',
+    lDur: '时    长', lFps: '序列帧率', lRes: '分 辨 率', oPortrait: '竖屏',
+    btnExportSeq: '导出序列', btnExportStill: '导出单帧', embed: '导出网页背景代码',
+    recLabel: '录制中', recStop: '停止',
+    mClose: '关闭', mEmbed: '网页背景代码',
+    dlEmbed: '下载 background.html', copyEmbed: '复制代码',
+    mEmbedNote1: '这是一个<b>可以直接双击打开、也可以直接当页面用的完整 HTML</b>——参数已经冻结在里面，零依赖、离线可用。把它存成 <span class="mono">background.html</span>，用 <span class="mono">&lt;iframe&gt;</span> 嵌进你的网页即可：',
+    mEmbedNote2: '想让它在你的页面里当背景层：把 <span class="mono">&lt;canvas id="gf"&gt;</span> 和那段脚本直接粘到你的页面里，然后给 <span class="mono">#gf</span> 设 <span class="mono">position:fixed;inset:0;z-index:-1</span> 即可。',
+    tAutoQuality: '已自动降低渲染分辨率以保持流畅（拖动"渲染画质"可固定）',
+    tReseeded: '换了一个构图', tFactoryDone: '已恢复出厂设置',
+    tDownloaded: '已下载 background.html', tCopied: '代码已复制',
+    tSpeed: '速度', tSize: '色块大小',
+    cfFactory: '把所有参数恢复到出厂默认？（配色、调色、动态、质感、基调都会重置）',
+    cfBigExport: (total, w, h) => `这批序列约 ${total} 帧 / ${w}×${h}，预计占用 500MB 以上内存。\n建议：缩短时长或降低分辨率。\n\n仍然继续吗？`,
+    recProgress: (i, n) => `渲染中 ${i} / ${n} 帧`,
+    tStillExported: (w, h) => `已导出 ${w}×${h} 静帧`,
+    tSeqExported: (n, fps) => `已导出 ${n} 帧 PNG 序列（${fps}fps，zip）`,
+    tSwatch: n => `取色点 ${n} / ${SWATCH_N} · 点击改这一段颜色`,
+    aSwatch: n => `取色点 ${n} / ${SWATCH_N} 的颜色`,
+    tReset: k => `重置「${k}」为默认值`,
+  },
+  en: {
+    docTitle: 'Gradient Flow',
+    appTitleL: 'Gradient Flow', appTitleR: 'Motion · Output',
+    collapse: 'Collapse', panelChip: '‹ Show panel ›', langLabel: 'Language',
+    pause: 'Pause', play: 'Play',
+    tCollapse: 'Collapse both panels (Tab)', tPause: 'Space to play / pause',
+    tFactory: 'Reset band / grade / motion / texture to factory defaults', tReseed: 'Draw a new layout (new random seed)',
+    sPreset: 'Presets', sBand: 'Band · Stops', sGrade: 'Colour grade', sMotion: 'Motion',
+    sTexture: 'Texture', sGlass: 'Glass', sOut: 'Export',
+    lBri: 'Brightness', lCon: 'Contrast', lSat: 'Saturation', lHue: 'Hue',
+    lEdited: 'Manually edited',
+    lQuality: 'Render quality', qSmooth: 'Smooth', qStd: 'Standard', qHigh: 'High',
+    factory: 'Restore defaults',
+    lSpeed: 'Speed', lSize: 'Blob size', lRnd: 'Randomness', lCount: 'Blob count', reseed: 'New layout',
+    lGrain: 'Grain', lVin: 'Vignette', lSoft: 'Edge softness', lWarp: 'Warp', lGap: 'Blob gap',
+    lGlassSw: 'Glass surface', lGlassType: 'Glass type',
+    gFrost: 'Frosted', gReeded: 'Reeded', gPeel: 'Orange peel', gWeave: 'Woven', gGrid: 'Grid',
+    lFrostAmt: 'Glass amount', lGlassSize: 'Glass scale', lGlassHi: 'Highlight',
+    lContent: 'Content', oSeq: 'Sequence', oStill: 'Still',
+    lDur: 'Duration', lFps: 'Frame rate', lRes: 'Resolution', oPortrait: 'Portrait',
+    btnExportSeq: 'Export sequence', btnExportStill: 'Export still', embed: 'Export embed code',
+    recLabel: 'Recording', recStop: 'Stop',
+    mClose: 'Close', mEmbed: 'Embed code',
+    dlEmbed: 'Download background.html', copyEmbed: 'Copy code',
+    mEmbedNote1: 'A <b>complete HTML file you can double-click to open, or drop straight into a page</b> — the parameters are frozen inside it. No dependencies, works offline. Save it as <span class="mono">background.html</span> and embed it with <span class="mono">&lt;iframe&gt;</span>:',
+    mEmbedNote2: 'To use it as a background layer: paste the <span class="mono">&lt;canvas id="gf"&gt;</span> element and its script into your page, then give <span class="mono">#gf</span> <span class="mono">position:fixed;inset:0;z-index:-1</span>.',
+    tAutoQuality: 'Render resolution was lowered automatically to stay smooth (pick a fixed Render quality to lock it)',
+    tReseeded: 'New layout drawn', tFactoryDone: 'Factory defaults restored',
+    tDownloaded: 'background.html downloaded', tCopied: 'Code copied',
+    tSpeed: 'Speed', tSize: 'Blob size',
+    cfFactory: 'Restore every parameter to factory defaults? (presets, grade, motion and texture will all reset)',
+    cfBigExport: (total, w, h) => `About ${total} frames at ${w}×${h} — this will need more than 500 MB of memory.\nTry a shorter duration or a lower resolution.\n\nContinue anyway?`,
+    recProgress: (i, n) => `Rendering ${i} / ${n} frames`,
+    tStillExported: (w, h) => `Exported ${w}×${h} still`,
+    tSeqExported: (n, fps) => `Exported ${n} PNG frames (${fps}fps, zip)`,
+    tSwatch: n => `Stop ${n} / ${SWATCH_N} · click to recolour this segment`,
+    aSwatch: n => `Colour of stop ${n} / ${SWATCH_N}`,
+    tReset: k => `Reset “${k}” to its default`,
+  },
+};
+let LANG = 'zh';
+try { const saved = localStorage.getItem('gf.lang'); if (saved === 'en' || saved === 'zh') LANG = saved; } catch (e) {}
+const tr = k => (I18N[LANG] && I18N[LANG][k] !== undefined) ? I18N[LANG][k]
+  : (I18N.zh[k] !== undefined ? I18N.zh[k] : k);
+window.__GF_I18N = I18N;         // 测试钩子：检查中英词条是否一一对应
+/* 玻璃类型 → i18n 键（GLASS 表里的 name 只有中文，只用于注释与旧代码；界面一律走 tr） */
+const GLASS_KEY = ['gFrost', 'gReeded', 'gPeel', 'gWeave', 'gGrid'];
+const glassName = i => tr(GLASS_KEY[i | 0] || GLASS_KEY[0]);
+/* 预设名：中英各一份（PRESETS 里的 en 字段） */
+const presetName = p => (LANG === 'en' && p.en) ? p.en : p.name;
+
+/* mulberry32：小而够用的确定性伪随机。种子化是"换一个构图"能复现的前提。 */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ============================================================ 1. 色彩空间 */
+const srgbToLinear = c => c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const linearToSrgb = c => c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+
+function hex2rgb(hex) {
+  const h = hex.replace('#', '');
+  return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255];
+}
+function rgb2hex(r, g, b) {
+  const f = v => clamp(Math.round(v * 255), 0, 255).toString(16).padStart(2, '0');
+  return '#' + f(r) + f(g) + f(b);
+}
+function rgb2hsv(r, g, b) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d > 1e-6) {
+    if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, mx <= 1e-6 ? 0 : d / mx, mx];
+}
+function hsv2rgb(h, s, v) {
+  h = ((h % 360) + 360) % 360 / 60;
+  const c = v * s, x = c * (1 - Math.abs(h % 2 - 1)), m = v - c;
+  const t = h < 1 ? [c, x, 0] : h < 2 ? [x, c, 0] : h < 3 ? [0, c, x]
+    : h < 4 ? [0, x, c] : h < 5 ? [x, 0, c] : [c, 0, x];
+  return [t[0] + m, t[1] + m, t[2] + m];
+}
+function srgb2oklabLike(r, g, b) {   // 只用来算感知亮度权重
+  return 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
+}
+
+/* ============================================================ 2. 配色预设 */
+/* 每条 = 一组 sRGB 色标，沿色带均匀插值。曲线本身与图片取色共用同一套下游管线。
+   en 是英文界面用的名字（中英切换时重绘预设按钮上的文字）。
+   ⚠️ 色标顺序 = 色带上的顺序，不是"亮度排序"：一条预设就是一段可以来回流动的渐变色带。 */
+const PRESETS = [
+  { id: 'gray', name: '黑白', en: 'Mono', stops: ['#0b0b0c', '#3a3a3d', '#7c7c80', '#c9c9cc', '#f4f4f5'] },
+  { id: 'mist', name: '雾白', en: 'Mist', stops: ['#e9e6ef', '#cfd6e4', '#aab6cd', '#8e9cba', '#f6f4f1'] },
+  { id: 'amber', name: '暖橙', en: 'Amber', stops: ['#f6ead6', '#f4c48a', '#e88a3c', '#d6552a', '#f2b48c'] },
+  { id: 'ocean', name: '深海', en: 'Ocean', stops: ['#eef4f8', '#a8c8e8', '#3f74d0', '#1b3f96', '#0a1a44'] },
+  { id: 'bloom', name: '粉紫', en: 'Bloom', stops: ['#fdf3f7', '#f4b6d8', '#c99ae6', '#6f6ae0', '#f0d9f2'] },
+  { id: 'jade', name: '青碧', en: 'Jade', stops: ['#f0f7f2', '#a9dcc6', '#4fa98c', '#1f6b63', '#0d2f36'] },
+  { id: 'dusk', name: '暮色', en: 'Dusk', stops: ['#f6e7dd', '#e8a98d', '#c96b6b', '#6b4a7a', '#241c3c'] },
+  { id: 'sand', name: '沙金', en: 'Sand', stops: ['#faf4e6', '#ecd9a8', '#cfa964', '#8a6a35', '#3a2c18'] },
+  /* 2026-10-02 夜间任务：用户提供两张参考图，取色成两套配色预设。
+     图片就在本项目的 reference/ 下（绝对路径与取色方法写在 README
+     「两条新预设的来源：用户给的参考图」一节）：
+       prism  ← reference/ba4e7c899e771bec63582a5efdbec78d.jpg（蓝橙虹彩玻璃圆环）
+     色标是从图片像素里按色相分桶聚类出来的实际颜色（暗部 → 主色 → 高光 → 暖端），
+     不是凭印象填的。
+     2026-10-03 第 2 轮：用户点名**去掉「铬银」（chrome）**，换成他自己在界面里调好的那套 ——
+     素材是 reference/新增配色.png（他自己截的 "02 色带·取色点" 那一行）。
+     取法：定位 12 个色块的中心，各取 5 列 × 6 行的中位数（避开色块里的白点），
+     得到的 12 个颜色**原样**当 12 个色标 —— 12 个色标在色带上的位置正好就是
+     12 个色块的位置，所以预设还原出来与截图逐块一致。取样位置与结果见 README。 */
+  { id: 'prism', name: '幻彩', en: 'Prism', stops: ['#101a3c', '#263c7f', '#4d95b3', '#c3c6c0', '#fdcca1', '#bf9f52', '#96432b'] },
+  { id: 'obsidian', name: '曜石', en: 'Obsidian',
+    stops: ['#000000', '#1f326c', '#000000', '#000101', '#000000', '#0f2383', '#000000', '#000000', '#212021', '#c73332', '#c18026', '#cfcfcf'] },
+];
+
+/* ============================================================ 3. 状态 */
+const LUT_N = 512;                       // 色带采样数
+const SWATCH_N = 12;                     // 骑在色带上的取色点数
+const SAMPLE_BW = 6;                     // 取样线垂直带宽（像素，两侧各 6）
+
+const state = {
+  seed: 20260915,
+  speed: 0.5, size: 1.0, rnd: 1.0, count: 6, map: 0.7,
+  grain: 1.0, vin: 0.0, soft: 0.1, gap: 0.0, field: 3.8, warp: 2.0, frost: 0.6, warpEps: 0.02,
+  /* 玻璃（2026-09）：frost 的语义从「毛玻璃强度」升级成「玻璃强度」，
+     键名保持不变 —— 旧存档里的 frost 值继续有效，默认仍是 0.6。
+     默认类型 0 = 毛玻璃（纯模糊）→ 出厂观感与加玻璃之前逐像素一致。
+     2026-09 二次改版（用户要求）：玻璃独立成 07 区并加总开关 glassOn，
+     默认**开** —— 因为"出厂观感逐字节不变"是用户更早定下的硬约束，而毛玻璃
+     本来就是出厂观感的一部分；关掉才是"完全没有玻璃"。
+     glassSize / glassHi 是**可调滑块**，默认值随类型走（见 GLASS 表）。
+     ⚠️ 用户 2026-09 澄清过：那张表里的数（长虹 1/0.05、橘皮 0.4/0.13、布纹 0.6/0）
+     是**该类型的默认值**，不是"锁死不让调"—— 切类型套默认，之后滑块照常能用。
+     2026-09 夜间任务：用户点名改了三个类型的默认（长虹高光 0.08→0.05、
+     橘皮 0.45/0.30→0.40/0.13、方格 1.00/0.20→0.40/0.00），表里已是新值。 */
+  glassOn: true, glassType: 0, glassSize: 1.0, glassHi: 0.0,
+  bri: 1, con: 1, sat: 1, hueShift: 0,
+  gradMode: 1,            // 1 = 色标连续插值（无量化台阶）0 = 512 点纹理查表
+  colMix: 0.25,           // 色带取色 ↔ RGB 混色的插值（越大色块越互相染色，也越灰）
+  quality: 1, adaptive: true, outW: 1920, outH: 1080, dur: 6,
+  preset: 'gray',
+  paused: false,
+};
+
+const rawCurve = new Float32Array(LUT_N * 3);   // sRGB，图片或预设
+const swatchOff = new Float32Array(SWATCH_N * 3); // sRGB 差值
+const lut = new Float32Array(LUT_N * 4);        // linear RGBA（给纹理）
+let lutSrgb = new Float32Array(LUT_N * 3);      // 当前显示色（含调色），给 UI
+const lutSrgbExact = new Float32Array(LUT_N * 3); // 同上的浮点精确值（基准色要用它，避免量化累积）
+
+/* ============================================================ 4. 调色管线 */
+const swatchCenter = n => (n + 0.5) * (LUT_N / SWATCH_N);
+const _sw = new Float32Array(SWATCH_N);
+
+function swatchWeights(i, out) {
+  let sum = 0;
+  for (let n = 0; n < SWATCH_N; n++) {
+    const w = clamp01(1 - Math.abs(i - swatchCenter(n)) / (LUT_N / SWATCH_N));
+    out[n] = w; sum += w;
+  }
+  if (sum > 0) for (let n = 0; n < SWATCH_N; n++) out[n] /= sum;
+  return sum;
+}
+const swatchEdited = n => swatchOff[n * 3] !== 0 || swatchOff[n * 3 + 1] !== 0 || swatchOff[n * 3 + 2] !== 0;
+const editedCount = () => { let c = 0; for (let n = 0; n < SWATCH_N; n++) if (swatchEdited(n)) c++; return c; };
+
+/* 色相旋转用 YIQ 矩阵（线性的近似，够用且无分支） */
+function hueRotate(r, g, b, deg) {
+  if (!deg) return [r, g, b];
+  const a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  const m = [
+    0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928,
+    0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283,
+    0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072,
+  ];
+  return [m[0] * r + m[1] * g + m[2] * b, m[3] * r + m[4] * g + m[5] * b, m[6] * r + m[7] * g + m[8] * b];
+}
+
+/* 单点全流程（sRGB 进，linear 出）。顺序：取色点 → 色相 → 饱和度 → 明度 → 对比度。
+   注意"取色点"改的是局部，"色彩调整"改的是整体，两者作用于不同阶段，不会互相覆盖。 */
+function gradeSrgb(r, g, b, out) {
+  let R = clamp01(r), G = clamp01(g), B = clamp01(b);
+
+  let lr = srgbToLinear(R), lg = srgbToLinear(G), lb = srgbToLinear(B);
+  const Y = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+
+  if (state.hueShift) {
+    const h = hueRotate(lr, lg, lb, state.hueShift);
+    lr = clamp01(h[0]); lg = clamp01(h[1]); lb = clamp01(h[2]);
+  }
+  if (state.sat !== 1) {
+    lr = Y + (lr - Y) * state.sat; lg = Y + (lg - Y) * state.sat; lb = Y + (lb - Y) * state.sat;
+  }
+  if (state.bri !== 1) { lr *= state.bri; lg *= state.bri; lb *= state.bri; }
+  if (state.con !== 1) {
+    // 对比度在 display 域做（(c−0.5)·k+0.5），这是「看起来对」的那个域
+    let dr = clamp01(linearToSrgb(clamp01(lr))), dg = clamp01(linearToSrgb(clamp01(lg))), db = clamp01(linearToSrgb(clamp01(lb)));
+    dr = clamp01((dr - 0.5) * state.con + 0.5); dg = clamp01((dg - 0.5) * state.con + 0.5); db = clamp01((db - 0.5) * state.con + 0.5);
+    lr = srgbToLinear(dr); lg = srgbToLinear(dg); lb = srgbToLinear(db);
+  }
+  out[0] = clamp01(lr); out[1] = clamp01(lg); out[2] = clamp01(lb);
+}
+
+const _g = [0, 0, 0], _s3 = [0, 0, 0];
+function rebuildLUT() {
+  for (let i = 0; i < LUT_N; i++) {
+    let r = rawCurve[i * 3], g = rawCurve[i * 3 + 1], b = rawCurve[i * 3 + 2];
+    if (swatchWeights(i, _sw) > 0) {
+      for (let n = 0; n < SWATCH_N; n++) {
+        const w = _sw[n];
+        if (w <= 0) continue;
+        r += swatchOff[n * 3] * w; g += swatchOff[n * 3 + 1] * w; b += swatchOff[n * 3 + 2] * w;
+      }
+    }
+      gradeSrgb(r, g, b, _g);
+    lut[i * 4] = _g[0]; lut[i * 4 + 1] = _g[1]; lut[i * 4 + 2] = _g[2]; lut[i * 4 + 3] = 1;
+    // UI 显示的 sRGB（调色后再转回 display 域）
+    lutSrgbExact[i * 3] = clamp01(linearToSrgb(_g[0]));
+    lutSrgbExact[i * 3 + 1] = clamp01(linearToSrgb(_g[1]));
+    lutSrgbExact[i * 3 + 2] = clamp01(linearToSrgb(_g[2]));
+    lutSrgb[i * 3] = lutSrgbExact[i * 3];
+    lutSrgb[i * 3 + 1] = lutSrgbExact[i * 3 + 1];
+    lutSrgb[i * 3 + 2] = lutSrgbExact[i * 3 + 2];
+  }
+  buildGradStops();
+  uploadLUT();
+  drawBand();
+  drawSwatches();
+  updateEditedLabel();
+  saveSoon();
+  renderDirty = true;
+}
+
+/* 把 512 点色带抽成 N 个色标（linear 空间）。
+   色标数量少 → 相邻色标之间的过渡是纯线性插值，不可能出现量化等值线；
+   顺带压掉"颜色太多"的碎斑感。抽样用等距 + 端点对齐，保证首尾就是色带两端。 */
+function buildGradStops() {
+  const N = gradStops.n;
+  for (let k = 0; k < N; k++) {
+    const u = k / (N - 1);
+    const x = u * (LUT_N - 1);
+    const i0 = Math.min(LUT_N - 1, Math.floor(x)), i1 = Math.min(LUT_N - 1, i0 + 1);
+    const f = x - i0;
+    for (let c = 0; c < 3; c++) gradStops.arr[k * 3 + c] = lerp(lut[i0 * 4 + c], lut[i1 * 4 + c], f);
+  }
+}
+/* 色标数量固定为 12。
+   曾经做成滑块，但实测它**不是"精细度"而是"换一套颜色"**：色带被切成不均匀的色段，
+   均匀取 N 个点时 N 变了取到的颜色就完全不同
+   （暮色预设：3→红褐、12→紫粉、32→暖橙；画面里出现的颜色数还从 1034 掉到 382）。
+   预设本身只有 5 个精心配的色标，12 个采样点足够平滑，所以直接固定。 */
+const GRAD_STOP_N = 12;
+const gradStops = { n: GRAD_STOP_N, arr: new Float32Array(GRAD_STOP_N * 3) };
+let domRGB = [0.5, 0.5, 0.5];   // 保留给将来的和谐化用，目前不参与着色
+
+function lutSrgbIndex(n) { return swatchExactRGB(n); }   // 统一走精确值（8bit 采样只用于显示）
+
+/* 取色点在色带上的精确颜色（浮点，不经过 8bit LUT）。
+   取色器写回时的"基准色"必须用它：拿 8bit 采样值当基准，量化误差会在每次写入时
+   累积，同一个目标色反复写会左右横跳（实测 #454549 ↔ #3a7ad2 来回摆）。 */
+/* 取色点在色带上的精确显示色（浮点插值 lutSrgbExact）。
+   必须用 lutSrgbExact 而不是 lutSrgb：后者是 8bit 精度的（给纹理用），
+   相邻两点常常只差 1 级，插值出来的值和真值能差到两三个色阶 ——
+   拿它当"基准色"会让改色算出的差值偏小，同一个目标色反复写就永远收敛不到正确值。
+   注意：一定要取**调色之后**的值。早先图省事直接拿 rawCurve 算，
+   而显示的是调色后的颜色（亮调统一掺 5% 白），基准系统性偏暗 →
+   同一个目标色反复写会在两个值之间来回横跳，永远收敛不了。 */
+function swatchExactRGB(n) {
+  const p = swatchCenter(n) - 0.5;
+  const i0 = clamp(Math.floor(p), 0, LUT_N - 1), i1 = Math.min(LUT_N - 1, i0 + 1);
+  const f = p - i0;
+  return [
+    clamp01(lerp(lutSrgbExact[i0 * 3], lutSrgbExact[i1 * 3], f)),
+    clamp01(lerp(lutSrgbExact[i0 * 3 + 1], lutSrgbExact[i1 * 3 + 1], f)),
+    clamp01(lerp(lutSrgbExact[i0 * 3 + 2], lutSrgbExact[i1 * 3 + 2], f)),
+  ];
+}
+function setRawFromStops(stops) {
+  const rgb = stops.map(hex2rgb);
+  const segs = rgb.length - 1;
+  for (let i = 0; i < LUT_N; i++) {
+    const t = i / (LUT_N - 1) * segs;
+    const k = Math.min(segs - 1, Math.floor(t)), f = t - k;
+    for (let c = 0; c < 3; c++) rawCurve[i * 3 + c] = lerp(rgb[k][c], rgb[k + 1][c], f);
+  }
+}
+
+/* ============================================================ 6. 色带 + 取色点 UI */
+const bandEl = $('band'), swWrap = $('swatches');
+const swColor = [], swBtns = [];
+let scanning = false;         // 取色器开着 = 基准色冻结
+
+function buildSwatches() {
+  swWrap.textContent = ''; swColor.length = 0; swBtns.length = 0;
+  for (let n = 0; n < SWATCH_N; n++) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'sw'; b.dataset.n = String(n);
+    b.title = tr('tSwatch')(n + 1);
+    b.setAttribute('aria-label', tr('aSwatch')(n + 1));
+    const i = document.createElement('i'), dot = document.createElement('b');
+    const x = document.createElement('span'); x.className = 'x'; x.dataset.clear = '1'; x.textContent = '×';
+    b.append(i, dot, x);
+    b.addEventListener('click', e => {
+      if (e.target.closest('.x')) return;      // × 是"还原这个点"，不是"打开取色器"
+      openPicker(n, b);
+    });
+    swWrap.appendChild(b);
+    swColor.push('#000000'); swBtns.push(b);
+  }
+}
+/* 切语言时刷新取色点的提示文字（元素在 buildSwatches 里建，这里只改文案） */
+function refreshSwatchLabels() {
+  swBtns.forEach((b, n) => { b.title = tr('tSwatch')(n + 1); b.setAttribute('aria-label', tr('aSwatch')(n + 1)); });
+}
+
+function drawSwatches() {
+  const w = swWrap.clientWidth || 220;
+  for (let n = 0; n < SWATCH_N; n++) {
+    const hex = rgb2hex(...lutSrgbIndex(n));
+    swColor[n] = hex;
+    const b = swBtns[n]; if (!b) continue;
+    b.firstElementChild.style.background = hex;
+    b.style.left = ((n + 0.5) / SWATCH_N * 100).toFixed(4) + '%';
+    b.style.width = Math.max(9, Math.min(30, w / SWATCH_N)) + 'px';
+    b.classList.toggle('edited', swatchEdited(n));
+  }
+}
+
+/* 取色点写回：offset = 目标色 − 打开取色器那一刻的基准色。
+   用固定基准，连续拖动多少次都不会累积漂移（这是 ring-strands 踩过的坑）。 */
+/* 取色点写回：基准色由调用方在**打开取色器/发起改色的那一刻**传入（而不是内部维护
+   一份可变状态）。差值的语义是"目标色 − 基准色"，按权重叠加到色带上。
+   早先内部维护 swBase 可变状态，出现过"同一个目标色反复写入在正确值与近似值之间
+   来回横跳"的问题（rebuildLUT 之后精确值有极小漂移，基准停在旧值上就会把第二次
+   写入算成"几乎不用改"）。改成显式传参后，这条路径没有任何隐藏状态，行为可预测。 */
+function applySwatch(n, baseRGB, hex) {
+  const r = hex2rgb(hex);
+  const t = [r[0] - baseRGB[0], r[1] - baseRGB[1], r[2] - baseRGB[2]];
+  for (let c = 0; c < 3; c++) swatchOff[n * 3 + c] = clamp(t[c], -1, 1);
+  rebuildLUT();
+  /* 迭代校正：色带是 512 点采样 + 权重归一化 + 整条调色，一次写入的落点与目标之间
+     可能差几个色阶（相邻取色点还有权重交叠）。与其去推这个映射的解析式，不如
+     直接量出偏差再补一次 —— 实测 2~3 次就完全命中，且对任何调色参数都成立。 */
+  for (let pass = 0; pass < 3; pass++) {
+    const cur = swatchExactRGB(n);
+    let err = 0;
+    for (let c = 0; c < 3; c++) err = Math.max(err, Math.abs(cur[c] - r[c]));
+    if (err < 1.5 / 255) break;
+    for (let c = 0; c < 3; c++) swatchOff[n * 3 + c] = clamp(swatchOff[n * 3 + c] + (r[c] - cur[c]), -1, 1);
+    rebuildLUT();
+  }
+}
+
+swWrap.addEventListener('click', e => {
+  const x = e.target.closest('.x'); if (!x) return;
+  e.preventDefault(); e.stopPropagation();
+  const n = parseInt(x.parentElement.dataset.n, 10);
+  swatchOff[n * 3] = swatchOff[n * 3 + 1] = swatchOff[n * 3 + 2] = 0;
+  rebuildLUT();
+});
+
+/* 色带预览画布复用一个 256×1 canvas：拖调色滑杆时 rebuildLUT 会频繁调用，
+   原先每次都新建 canvas + createImageData，白白制造 GC。 */
+const bandCanvas = document.createElement('canvas');
+bandCanvas.width = 256; bandCanvas.height = 1;
+const bandCtx = bandCanvas.getContext('2d');
+const bandImage = bandCtx.createImageData(256, 1);
+function drawBand() {
+  const im = bandImage;
+  for (let x = 0; x < 256; x++) {
+    const i = Math.round(x / 255 * (LUT_N - 1));
+    im.data[x * 4] = Math.round(lutSrgb[i * 3] * 255);
+    im.data[x * 4 + 1] = Math.round(lutSrgb[i * 3 + 1] * 255);
+    im.data[x * 4 + 2] = Math.round(lutSrgb[i * 3 + 2] * 255);
+    im.data[x * 4 + 3] = 255;
+  }
+  bandCtx.putImageData(im, 0, 0);
+  bandEl.style.backgroundImage = `url(${bandCanvas.toDataURL()})`;
+  bandEl.style.backgroundSize = '100% 100%';
+}
+
+function updateEditedLabel() {
+  const c = editedCount();
+  $('vEdited').textContent = `${c} / ${SWATCH_N}`;
+  const rv = $('revert'); if (rv) rv.disabled = c === 0;
+}
+
+/* ============================================================ 7. 内联 HSV 取色器 */
+const pickerEl = $('picker'), svC = $('svC'), svCtx = svC.getContext('2d');
+const svDot = $('svDot'), hueEl = $('hue'), pickHex = $('pickHex'), pickChip = $('pickChip');
+let pickN = -1, pickH = 0, pickS = 1, pickV = 1, pickBase = [0, 0, 0];
+
+function drawSV() {
+  const w = svC.width, h = svC.height;
+  svCtx.clearRect(0, 0, w, h);
+  const g1 = svCtx.createLinearGradient(0, 0, w, 0);
+  g1.addColorStop(0, '#fff'); g1.addColorStop(1, `hsl(${pickH} 100% 50%)`);
+  svCtx.fillStyle = g1; svCtx.fillRect(0, 0, w, h);
+  const g2 = svCtx.createLinearGradient(0, 0, 0, h);
+  g2.addColorStop(0, 'rgba(0,0,0,0)'); g2.addColorStop(1, '#000');
+  svCtx.fillStyle = g2; svCtx.fillRect(0, 0, w, h);
+  svDot.style.left = (pickS * w) + 'px';
+  svDot.style.top = ((1 - pickV) * h) + 'px';
+}
+
+function openPicker(n, anchor) {
+  pickN = n;
+  scanning = true;
+  pickBase = swatchExactRGB(n);              // 打开这一刻的基准色，冻结在局部变量里
+  const hsv = rgb2hsv(...pickBase);
+  pickH = hsv[0]; pickS = hsv[1]; pickV = hsv[2];
+  hueEl.value = Math.round(pickH);
+  drawSV();
+  syncPickerUI();
+  pickerEl.classList.add('on');
+  const r = anchor.getBoundingClientRect();
+  const pw = 190, ph = pickerEl.offsetHeight || 208;
+  pickerEl.style.left = clamp(r.left + r.width / 2 - pw / 2, 10, innerWidth - pw - 10) + 'px';
+  pickerEl.style.top = clamp(r.top - ph - 10, 10, innerHeight - ph - 10) + 'px';
+  swBtns.forEach(b => b.classList.remove('open'));
+  anchor.classList.add('open');
+}
+function closePicker() {
+  if (!pickerEl.classList.contains('on')) return;
+  pickerEl.classList.remove('on');
+  swBtns.forEach(b => b.classList.remove('open'));
+  pickN = -1; scanning = false;
+}
+function syncPickerUI() {
+  const hex = rgb2hex(...hsv2rgb(pickH, pickS, pickV));
+  pickHex.value = hex; pickChip.style.background = hex;
+  if (pickN >= 0) applySwatch(pickN, pickBase, hex);
+}
+(function bindPicker() {
+  let svDrag = false;
+  const svMove = e => {
+    const r = svC.getBoundingClientRect();
+    pickS = clamp01((e.clientX - r.left) / r.width);
+    pickV = clamp01(1 - (e.clientY - r.top) / r.height);
+    drawSV(); syncPickerUI();
+  };
+  svC.addEventListener('pointerdown', e => { svDrag = true; svC.setPointerCapture(e.pointerId); svMove(e); e.preventDefault(); });
+  svC.addEventListener('pointermove', e => { if (svDrag) svMove(e); });
+  svC.addEventListener('pointerup', e => { svDrag = false; try { svC.releasePointerCapture(e.pointerId); } catch (err) { } });
+  hueEl.addEventListener('input', () => { pickH = +hueEl.value; drawSV(); syncPickerUI(); });
+  pickHex.addEventListener('change', () => {
+    const v = pickHex.value.trim();
+    if (!/^#?[0-9a-fA-F]{6}$/.test(v)) { syncPickerUI(); return; }
+    const hsv = rgb2hsv(...hex2rgb(v.startsWith('#') ? v : '#' + v));
+    pickH = hsv[0]; pickS = hsv[1]; pickV = hsv[2];
+    hueEl.value = Math.round(pickH); drawSV(); syncPickerUI();
+  });
+  document.addEventListener('pointerdown', e => {
+    if (!pickerEl.classList.contains('on')) return;
+    if (pickerEl.contains(e.target) || e.target.closest('.sw')) return;
+    closePicker();
+  }, true);
+  addEventListener('resize', closePicker);
+})();
+
+/* ============================================================ 8. WebGL */
+const canvas = $('gl');
+const gl = canvas.getContext('webgl2', {
+  alpha: false, antialias: false, depth: false, stencil: false,
+  premultipliedAlpha: false, preserveDrawingBuffer: true,   // 导出/自动化截图要和 render 在同一个同步任务里读像素
+  powerPreference: 'high-performance',
+});
+if (!gl) {
+  document.body.innerHTML = '<div style="padding:40px;font:14px/1.8 -apple-system,sans-serif;color:#eee">' +
+    '这个页面需要 WebGL2（Chrome / Edge / Safari 15+ / Firefox 都支持）。<br>请换一个现代浏览器打开。</div>';
+  throw new Error('no webgl2');
+}
+
+/* ---------------------------------------------------------------- 着色器
+   多趟管线（毛玻璃必须要有离屏趟，单趟里做不到真正的低通）：
+     ① FIELD    ：算色带坐标场 uBlend + 混色方向 chromaDir → RGBA16F 离屏纹理
+     ② BLUR H/V ：对场做可分离高斯模糊（两趟）
+     ③ COMPOSITE：取模糊后的场 → 查色带 → 基调/曝光/暗角 → 抖动 → 输出到画布
+   frost = 0 时自动跳过 ①②，直接单趟出图（省掉两次全屏绘制）。 */
+
+/* 共用的场计算：两个程序都 include 这段，避免两份实现走偏 */
+const GLSL_FIELD = `
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+/* 值噪声。色块位置完全由它驱动：便宜、够有机，且不会像 simplex 那样在大尺度上出现方向性纹路 */
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash12(i), b = hash12(i + vec2(1.0, 0.0));
+  float c = hash12(i + vec2(0.0, 1.0)), d = hash12(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+/* 噪声梯度——把"平铺噪声"当无方向流场用。
+   值噪声的梯度有个坏性质：极点附近退化成轴对齐（有限差分在 x/y 各自独立）。 */
+vec2 noiseGrad(vec2 p) {
+  float e = uWarpEps;
+  float n0 = vnoise(p);
+  return vec2(vnoise(p + vec2(e, 0.0)) - n0, vnoise(p + vec2(0.0, e)) - n0) / e;
+}
+/* 色块位置：利萨如漂移 + 每个色块独立的低频噪声摆动。
+   纯利萨如轨道是可预测的周期运动，叠加噪声后才真正不呆板、不重复。 */
+vec2 blobPos(int i, float fi, float t, vec4 A) {
+  vec2 ph = vec2(A.z, A.z * 1.37 + fi * 0.61);
+  vec2 pos = A.xy + (A.w * uRnd) * vec2(
+    sin(t * 0.47 + ph.x * PI2),
+    cos(t * 0.39 + ph.y * PI2));
+  pos += (vec2(vnoise(vec2(fi * 9.7, 3.1) + t * 0.085),
+               vnoise(vec2(5.3, fi * 7.9) - t * 0.073)) - 0.5)
+         * (0.30 + 0.85 * uRnd);
+  return pos;
+}
+/* 场对比扩展：以 0.5 为中心线性拉开。
+   注意不能用 pow(x, 1/g)——那个在 x<0.5 时是**压缩**、x>0.5 时才扩张，
+   整个场会被推向两端，实测比不扩还窄（0.32~0.59 → 0.62~0.80 那种）。 */
+float fieldCurve(float x, float gain) { return 0.5 + (clamp(x, 0.0, 1.0) - 0.5) * gain; }
+vec3 srgbOut(vec3 c) {
+  c = max(c, vec3(0.0));
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+/* 色带坐标场 + 混色方向。返回 (uField, chromaDir.xyz) */
+vec4 fieldValue(vec2 uv) {
+  /* ---- 域扭曲：让色团边缘从"圆形光斑"变成会流动的指状形状 ----
+     方向必须是梯度**本身**，不能把梯度旋 90°：值噪声的梯度在极点附近退化成
+     轴对齐的，旋 90° 后正好把它转成垂直/水平方向的条纹，全屏拉丝就是这么来的。 */
+  float wAmp = (0.05 + 0.13 * uRnd) * uWarp;
+  vec2 wq = uv * 1.7;
+  vec2 warp = vec2(0.0);
+  warp += noiseGrad(wq + vec2(0.0, uTime * 0.07));
+  warp += 0.5 * noiseGrad(wq * 2.03 - vec2(uTime * 0.11, 0.0));
+  warp += 0.25 * noiseGrad(wq * 4.11 + vec2(uTime * 0.16, uTime * 0.09));
+  vec2 p = uv + wAmp * clamp(warp, vec2(-3.0), vec2(3.0));
+
+  /* 第一趟：求最近块距离²（权重是相对它定义的） */
+  vec2 dCache[10];
+  float dMin2 = 1e9;
+  int N = uCount;
+  for (int i = 0; i < 10; i++) {
+    if (i >= N) break;
+    vec2 pos = blobPos(i, float(i), uTime, uBlobs[i]);
+    vec2 dd = p - (pos - 0.5);
+    /* 各向异性距离：屏幕 UV 是 aspect×1 的横长域。各向同性的欧氏距离下，
+       四角离最近色块也有 ~1.4，而色块之间只隔 ~0.7 —— 远处权重彼此接近，
+       场就塌成均匀中灰。把 x 距离按宽高比缩小 = 让色块影响域横向拉宽。 */
+    dd.x *= uAspect;
+    dCache[i] = dd;
+    dMin2 = min(dMin2, dot(dd, dd));
+  }
+  dMin2 = max(dMin2, 4e-4);        // 防止正落在色块中心时比值爆掉
+
+  /* 第二趟：加权混合。权重 = 0.5^((d²/dMin² − 1)·k) —— 相对最近块（尺度无关），
+     且用**指数核**而不是幂律：幂律 (dMin²/d²)^k 在 d=dMin 处导数不为零，
+     相邻色块的"等距线"上会出现折角，归一化后保留在场里，画面上就是硬折痕
+     （把"边缘柔和"调到 0.2 也去不掉，因为那改的是强度不是光滑性）。
+     指数核在 d=dMin 处导数恒为 0、处处 C∞，过渡天然是高斯那种柔雾。 */
+  /* K = 权重核的"分离度"：K 越大 → 最近色块越独占 → 纯色域越大、过渡带越窄。
+     两个滑块都作用在 K 上，但方向刻意不同（见 README 踩坑 36）：
+       · 边缘柔和 uSoft：数值越大 → K 越小 → 过渡越宽、边界越柔。
+         0.34875 是"保持出厂默认观感不变"的口径常数：
+         uSoft=0.75 / size=1 时 K=0.465，与旧公式 uSoft*0.62 逐像素一致。
+       · 色块大小 uSizeK：数值越大 → K 越大 → 色块更大、更分明。
+         半径 r 已随 size 线性放大，而 sizeK = refR/(0.85·r) 是 r 的倒数 ——
+         只看它的话 size 越大画面反而越糊（与滑块名字相反）。这里再乘 size²（JS 传进来），
+         净效果 K_eff ∝ size。 */
+  float K = (0.34875 / max(0.05, uSoft)) * uSizeK;
+  /* 半径真正参与权重。原式 0.5^((d²/dMin²−1)·K) 只看"相对最近块的距离比"，
+     半径 r 只出现在 uGap 那一项里 —— 而 gap 默认为 0，于是**色块大小滑块完全没接线**
+     （用户实测"调了没用"就是这里）。现在把半径折进距离度量：
+     r 相对典型块间距越大，同样距离下权重越平，影响域越宽。 */
+  float refR = max(1e-3, sqrt(dMin2));
+  vec3 cLin = vec3(0.0);
+  float uBlend = 0.0;
+  float wsum = 0.0;
+  for (int i = 0; i < 10; i++) {
+    if (i >= N) break;
+    vec2 d = dCache[i];
+    float r = max(0.12, uBlobB[i].x);
+    float d2 = dot(d, d) + 3e-4;
+    float sizeK = clamp(refR / (r * 0.85), 0.3, 4.0);
+    float w = exp2(-(d2 / dMin2 * sizeK - 1.0) * K);
+    w *= mix(1.0, smoothstep(0.0, r * r, d2), uGap);
+    float u = clamp(0.5 + (uBlobB[i].y - 0.5) * uMap + uBlobB[i].z * uRnd * 0.12, 0.0, 1.0);
+    cLin += w * sampleGrad(u);
+    uBlend += w * u;
+    wsum += w;
+  }
+  cLin /= max(wsum, 1e-5);
+  uBlend /= max(wsum, 1e-5);
+
+  /* ---- 配色：色带取色 + 混色，二者插值 ----
+     uField 是"色带坐标的加权混合"，cMix 是"RGB 的加权混合"。
+     纯 uField（在色带坐标里混合）动态范围好、颜色永远落在色带上，但色块之间
+     互不染色；纯 cMix 有互相染色的活力，但明暗互相平均会塌成中间灰。
+     两者插值兼顾 —— 关键是**亮度与色相走同一条路**。
+
+     曾经用过"亮度取 uField、色相取 cMix 的单位方向再相乘"的乘性重构，
+     实测那会系统性丢饱和度：参考图（中位饱和 0.41、明度集中在 0.43~0.87）
+     取色后画布饱和度只剩 0.235。乘性重构在暗部尤其失真，已弃用。 */
+  float uField = fieldCurve(uBlend, uFieldGain);
+  return vec4(uField, cLin);
+}
+`;
+
+const VS = `#version 300 es
+precision highp float;
+const vec2 P[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+void main() { gl_Position = vec4(P[gl_VertexID], 0.0, 1.0); }`;
+
+const GLSL_UNIFORMS = `
+precision highp float;
+precision highp int;
+const float PI2 = 6.2831853;
+uniform vec2  uRes;        // 渲染分辨率（像素）
+uniform float uTime;       // 已缩放的时间
+uniform float uPix;        // 设备像素比（颗粒/模糊半径按屏幕像素走，不随画质变）
+uniform float uGrainT;     // 颗粒时间（固定步进 → 胶片式跳动）
+uniform vec4  uBlobs[10];  // xy=位置(0..1) z=时间偏移 w=漂移幅度
+uniform vec4  uBlobB[10];  // x=半径 y=色带坐标 z=色相扰动 w=未用
+uniform int   uCount;
+uniform float uMap;        // 色带映射强度
+uniform float uSoft;       // 边缘柔和：越大 → 权重过渡越宽（越柔）
+uniform float uSizeK;      // 色块大小：= size²，越大 → 纯色域越大（越分明）
+uniform float uGap;        // 色块间隙
+uniform float uRnd;
+uniform float uGrain;
+uniform float uVignette;
+uniform float uAspect;      // 画布宽高比：各向异性距离用
+uniform float uFieldGain;   // 色带坐标的对比增益（不能叫 uField：着色器里 uField 是场值本身）
+uniform float uWarp;        // 域扭曲幅度倍率
+uniform float uWarpEps;     // 域扭曲的有限差分步长
+uniform int   uDebug;
+uniform sampler2D uLUT;
+uniform int   uGradMode;    // 0 = 纹理查表（512 点）1 = 色标插值（连续）
+uniform int   uGradN;       // 色标数量（≤ 12）
+uniform vec3  uGrad[12];    // 色标颜色（linear 空间，单调排列）
+` + `
+/* 按色带坐标取色。
+   两种模式：
+     · 纹理查表 —— 512 个采样点，本质是"分段常量"，在色相变化快的区段会出现等值线
+       （实测色相排序时满屏轮廓线，就是这个量化造成的）
+     · 色标插值 —— 12 个色标之间线性插值，连续无台阶；色标数量少还顺带压掉了
+       "颜色太多"导致的碎斑
+   两者都是精确的线性插值，开销相同。 */
+vec3 sampleGrad(float u) {
+  if (uGradMode == 0) return texture(uLUT, vec2(clamp(u, 0.0, 1.0), 0.5)).rgb;
+  float x = clamp(u, 0.0, 1.0) * float(uGradN - 1);
+  int i0 = int(floor(x));
+  int i1 = min(i0 + 1, uGradN - 1);
+  return mix(uGrad[i0], uGrad[i1], clamp(x - float(i0), 0.0, 1.0));
+}
+
+`;
+
+/* ① 场趟：把 (uField, chromaDir.xyz) 写进 RGBA16F 离屏纹理 */
+const FS_FIELD = `#version 300 es
+${GLSL_UNIFORMS}
+${GLSL_FIELD}
+out vec4 fragColor;
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  vec4 f = fieldValue(uv);
+  if (uDebug == 1) { fragColor = vec4(vec3(fieldCurve(f.x, 1.0 / uFieldGain) * 4.0), 1.0); return; }
+  fragColor = f;
+}`;
+
+/* ② 可分离高斯模糊：线性插值采样，一半的采样点覆盖两倍的范围（省一半 tap） */
+const FS_BLUR = `#version 300 es
+${GLSL_UNIFORMS}
+uniform sampler2D uFieldTex;
+uniform vec2 uDir;          // 模糊方向（像素单位；另一轴为 0）
+uniform float uRadius;      // 半径（像素；保留兼容，实际权重由 CPU 给）
+uniform float uBlurW[96];   // CPU 预计算的高斯权重（见 JS 的 uploadBlurWeights）
+uniform int   uBlurN;       // 实际 tap 数
+uniform float uBlurWSum;    // 含中心项的权重和
+out vec4 fragColor;
+void main() {
+  vec2 texel = 1.0 / uRes;
+  vec4 sum = texture(uFieldTex, gl_FragCoord.xy * texel);
+  /* 原先每个 tap 都在片元里算 exp；权重与像素无关，现在 CPU 算好、
+     片元只做采样和乘加（96 个权重放进 uniform 数组）。 */
+  for (int i = 1; i <= 96; i++) {
+    if (i > uBlurN) break;
+    float x = (float(i) - 0.5) * 2.0;        // 线性插值等价于在 ±0.5 处各取一次
+    float w = uBlurW[i - 1];
+    vec2 off = uDir * texel * x;
+    sum += w * (texture(uFieldTex, gl_FragCoord.xy * texel + off)
+              + texture(uFieldTex, gl_FragCoord.xy * texel - off));
+  }
+  fragColor = sum / uBlurWSum;
+}`;
+
+/* ③ 合成趟：查色带 → 基调 → 曝光 → 暗角 → 抖动 → sRGB → 画布 */
+const FS_COMPOSITE = `#version 300 es
+${GLSL_UNIFORMS}
+uniform sampler2D uFieldTex;
+uniform float uFrost;       // 毛玻璃强度（0 = 不模糊，省掉离屏趟）
+uniform float uMix;         // 色带取色 ↔ RGB 混色 的插值（色块互染程度）
+uniform vec2  uFieldRes;    // 场纹理分辨率（可能低于画布 —— 模糊趟在缩放分辨率上跑）
+/* 玻璃（2026-09 加）：把「毛玻璃」从一个滑块升级成一族玻璃类型。
+   uGlassAmt 沿用 state.frost（默认 0.6）—— 旧存档、旧导出物、URL 里的 frost 都还有效。 */
+uniform int   uGlass;       // 类型：0=毛玻璃 1=长虹 2=橘皮 3=布纹
+uniform float uGlassAmt;    // 强度（0 = 完全不加玻璃）
+uniform float uGlassSize;   // 纹理尺度（越大图案越大；毛玻璃类型下不用）
+uniform float uGlassHi;     // 表面高光强度
+out vec4 fragColor;
+/* 合成趟不 include 场计算那段，所以这里单独补上它用到的两个小工具 */
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec3 srgbOut(vec3 c) {
+  c = max(c, vec3(0.0));
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+/* ---- 玻璃表面（2026-09）----
+   参考的是真实建筑玻璃：长虹（竖向圆柱肋）、橘皮（砂面细颗粒）、布纹（菱格编织）。
+   全部程序化 —— 不引入任何贴图，且图案频率按画面高度归一 → 分辨率无关
+   （4K 导出与 1080p 预览的肋条数量一致，不会暴露贴图精度）。
+
+   关键是**折射**：用高度场的梯度去位移场纹理的采样坐标，像真透镜一样把背后的
+   画面拉扭；只把纹理叠在画面上只会显"脏"，不会显"玻璃"。
+   每个类型用自己给出的 pitch（特征周期）做差分步长，再把位移按 pitch 归一化 ——
+   这样"强度"在三种纹理之间是同一量纲（位移 ≈ 强度的 45% 个图案周期）。 */
+float glassNoise(vec2 p) {                      // 2 阶 value noise（够用且便宜）
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash12(i), b = hash12(i + vec2(1.0, 0.0));
+  float c = hash12(i + vec2(0.0, 1.0)), d = hash12(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float glassH(vec2 p, int type, float s, out float pitch) {
+  if (type == 1) {                              // 长虹：竖向圆柱肋
+    pitch = 0.010 * s;
+    float n = 6.2831853 / pitch;
+    /* 肋距不能太完美：叠两个低频相位扰动（真实玻璃是滚压出来的，肋距不匀）。
+       顺带把"完全周期"破掉，摩尔纹也轻一些。 */
+    float ph = p.x * n + 0.55 * sin(p.y * 2.7) + 0.28 * sin(p.y * 6.3 + 1.7);
+    return cos(ph) - 0.26 * cos(2.0 * ph);      // 二次谐波 → 柱面感（不是纯正弦）
+  }
+  if (type == 2) {                              // 橘皮：砂面细颗粒
+    pitch = 0.005 * s;
+    float q = 1.0 / pitch;
+    return glassNoise(p * q) * 0.68 + glassNoise(p * q * 2.03 + 7.1) * 0.32;
+  }
+  if (type == 3) {                              // 布纹：45° 菱格编织
+    pitch = 0.024 * s;
+    float q = 6.2831853 / pitch;
+    vec2 r = vec2(p.x + p.y, p.x - p.y) * q * 0.7071;
+    /* 真实布纹玻璃的编织线是**弯的**、而且纹路有的地方清楚有的地方几乎看不见
+       （表面本身有起伏）。所以两件事都要做：
+         · 相位扰动 —— 单位必须落在"图案周期"上，早先按 uv 给 0.55 只有 9% 个周期，
+           看起来还是笔直的；现在给 ~2 个 r 单位 ≈ 1/3 个格子
+         · 低频调幅 —— 让纹路的清晰度随画面缓慢呼吸（参考图里就是这样） */
+    r += 2.2 * vec2(sin(p.y * 3.1), sin(p.x * 2.7));
+    float breathe = 0.55 + 0.45 * glassNoise(p * 2.4);
+    return breathe * sin(r.x) * sin(r.y);
+  }
+  if (type == 4) {                              // 方格：轴对齐方砖（华夫格/蛋托表面）
+    /* 0.042：对着参考图量的 —— 参考图 1308px 高、砖约 55px，55/1308 ≈ 0.042。
+       （第一版按 0.018 写，渲染出来细得像布纹，格子太小反而不像"砖"。） */
+    pitch = 0.042 * s;
+    /* x、y 用**同一个**频率 —— 因为 p 是按画面高度归一化的，同频在屏幕上就是正方格
+       （长虹只用 p.x，所以它的肋条数会随画面宽高比变化，这是有意的：真实长虹是竖向通条）。 */
+    float q = 6.2831853 / pitch;
+    vec2 r = p * q;
+    /* 砖缝要基本是直的：不规则体现在"哪一段更亮/更暗"上（交给 breathe 调幅），
+       相位扰动给小（0.16）。给大了缝会蛇形，看着像编织网而不是压花砖。 */
+    r += 0.16 * vec2(sin(p.y * 2.9), sin(p.x * 2.5 + 1.1));
+    /* 用 cos+cos 的蛋托，不用 sin·sin 的枕头：
+         · 蛋托的缝沿轴线走（梯度只有水平/垂直）→ 屏幕上就是**轴对齐方格**
+         · 枕头的梯度峰值在对角线上 → 细尺度时连成菱形网、粗尺度时变成斜向 V 形纹
+           （两种尺度都实测过，都对不上参考图里横平竖直的砖缝）
+       · 0.16 那条 1/4 频率分量 = 参考图里每隔 4 块砖出现的一条更重的棱线（模具的"长十字"）
+       · 三次项把砖面压平、棱做陡 —— 1.9/0.9 是"再陡一点"的手调值 */
+    float g = 0.5 * (cos(r.x) + cos(r.y)) + 0.16 * (cos(0.25 * r.x) + cos(0.25 * r.y));
+    float gg = g * (1.9 - 0.9 * g * g);
+    float breathe = 0.62 + 0.38 * glassNoise(p * 2.1);   // 成片清楚 / 成片几乎看不见
+    return breathe * gg;
+  }
+  pitch = 0.06;                                 // 毛玻璃：只给很宽的板面起伏（配高光用）
+  return glassNoise(p / pitch) * 0.6 + glassNoise(p / (pitch * 0.37) + 5.0) * 0.4;
+}
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+  vec2 uv = (frag - 0.5 * uRes) / uRes.y;      // 画布 uv：暗角等视觉量用它
+  /* 采样场纹理：**必须复现场趟写纹理时用的那个 uv**。
+     场趟写的是 uvF = (gl_FragCoordF - 0.5*uResF) / uResF.y（uResF = 场纹理尺寸），
+     所以合成里要先做同样的归一化、再映射回 0..1，不能直接用 gl_FragCoord。
+     用错的表现是：低分辨率的场被放大时整体错位，画面像被"抽走"了结构
+     （实测均值从 123 漂到 150、结构全平）。 */
+  vec2 fieldTexel = 1.0 / uFieldRes;
+  vec2 uvF = (frag - 0.5 * uRes) / uRes.y;            // 画布 uv
+  vec2 fUV = clamp((uvF * uFieldRes.y + 0.5 * uFieldRes) / uFieldRes, vec2(0.0), vec2(1.0));
+
+  /* ---- 玻璃：高度场 → 折射位移 + 高光 ----
+     只在"要玻璃"时才算（默认类型是毛玻璃且强度 0.6，但它不做折射 ——
+     毛玻璃的观感就是纯模糊，必须与加玻璃之前逐像素一致）。 */
+  vec2 fUVd = fUV;
+  float glassSpec = 0.0, glassShade = 0.0;
+  /* 毛玻璃（type 0）默认不折射、高光为 0：3 次 glassH 算完完全不用。
+     只有纹理玻璃（折射）或手动给了高光时才需要这段。 */
+  if (uGlassAmt > 0.0001 && (uGlass != 0 || uGlassHi > 0.0001)) {
+    float pit = 0.0;
+    float h0 = glassH(uv, uGlass, uGlassSize, pit);
+    float e = pit * 0.12;                       // 差分步长按图案周期给 → 分辨率无关
+    float pa, pb;
+    vec2 g = vec2(glassH(uv + vec2(e, 0.0), uGlass, uGlassSize, pa) - h0,
+                  glassH(uv + vec2(0.0, e), uGlass, uGlassSize, pb) - h0) / e;
+    /* 归一化到"斜率幅值 ≈ 1"（正弦高度场 |∇h|·pitch ≈ 2π），
+       于是位移量可以用"图案周期的百分比"来表达，与纹理尺度无关。 */
+    vec2 slope = g * pit * 0.1591549;
+    if (uGlass != 0) {
+      /* 0.30 = 位移是"图案周期的 30%"，这是对着参考图调准的那个量。
+         2026-09 改版后四种纹理玻璃的强度**内置为 1**（不再开放调节），
+         所以把它从 0.5 改成 0.30 —— 让 uGlassAmt=1 正好落在原来 0.6×0.5 的观感上，
+         也就是你看到过的那些参考图效果。 */
+      vec2 disp = slope * pit * (uGlassAmt * 0.30);
+      /* fUV 与 uv 的换算：uv 按画布高度归一，fUV 按场纹理尺寸归一，
+         所以 x 方向要多乘一个场纹理的宽高比。 */
+      fUVd = clamp(fUV + disp * vec2(uFieldRes.y / uFieldRes.x, 1.0), vec2(0.0), vec2(1.0));
+    }
+    if (uGlassHi > 0.0001) {
+      vec3 nrm = normalize(vec3(-slope * 2.4, 1.0));
+      vec3 L = normalize(vec3(-0.35, 0.55, 0.75));   // 固定光源：左上偏前
+      float ndl = dot(nrm, L);
+      /* 圆柱面是"一侧亮、一侧暗"，只加白高光做不出参考图里那种明暗肋条，
+         所以这里同时给一个**可正可负**的明暗项 + 一条细高光。
+         GLASS_HI_GAIN：高光的"预设值单位"→ 内部系数的换算。预设是 0.05 / 0.13 / 0
+         （用户 2026-09 给定，夜间任务改过一轮：原为 0.08 / 0.30），而这套系数当初是
+         拿"高光 0.5"调准的 —— 乘 6 之后 0.05 正好回到那个观感。橘皮给 0.13 是合理的：
+         砂面的高度场坡度比正弦肋条平缓，同样的高光值看上去更弱，所以它需要更大的系数
+         才"看得见砂"。 */
+      float hi = uGlassHi * 6.0;
+      glassShade = ndl * 0.20 * hi;
+      glassSpec = pow(max(ndl, 0.0), 20.0) * 0.55 * hi;
+    }
+  }
+
+  /* 取场值。
+     场纹理默认 1/2 分辨率，双线性放大会磨掉一点高频 —— 所以**只在需要时**补模糊：
+       · 开了毛玻璃：场本来就糊，再补 3×3 只是去掉放大棱角（顺手省 16 次采样）
+       · 没开毛玻璃：直接采样。再补模糊只会让锐利的色块边界更软
+         （实测锐利高对比配置下 RMS 4.24 → 1.90）
+     这条分支省掉的是每像素最多 25 次纹理采样。 */
+  vec4 fs;
+  if (uFrost > 0.5) {
+    float sigma = max(1.5 * uPix / 3.0, 0.5);
+    float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    vec2 step5 = fieldTexel * max(vec2(1.0), uRes / uFieldRes);
+    vec4 acc = vec4(0.0); float wsum = 0.0;
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        vec2 o = vec2(float(i), float(j));
+        float w = exp(-dot(o, o) * inv2s2);
+        acc += w * texture(uFieldTex, fUVd + o * step5);
+        wsum += w;
+      }
+    }
+    fs = acc / wsum;
+  } else {
+    fs = texture(uFieldTex, fUVd);
+  }
+
+  if (uDebug == 3) { fragColor = vec4(uv * 0.5 + 0.5, 0.0, 1.0); return; }
+  if (uDebug == 6) { fragColor = vec4(vec3(fs.x), 1.0); return; }
+
+  float uField = fs.x;
+  vec3 cMix = max(fs.yzw, vec3(0.0));
+  if (uDebug == 7) { fragColor = vec4(sampleGrad(uField), 1.0); return; }
+  if (uDebug == 9) { fragColor = vec4(cMix, 1.0); return; }
+
+  /* 色带取色与混色插值；插值完再按主导色做一次"和谐化"。
+     没有基调开关了 —— 明度完全由色带决定，图片里没有的黑/灰就不会出现。 */
+  vec3 cLin = mix(sampleGrad(uField), cMix, uMix);
+
+  float vig = 1.0 - uVignette * smoothstep(0.35, 1.15, length(uv));
+  cLin *= vig;
+  if (glassSpec > 0.0 || glassShade != 0.0)
+    cLin += vec3(glassShade) + vec3(glassSpec);   // 明暗 + 细高光：加白/压暗，不动色相（uGlassHi 已在上面乘进去）
+
+  if (uDebug == 10) { fragColor = vec4(srgbOut(cLin), 1.0); return; }   // 玻璃确定性视图（无颗粒/抖动）
+
+  vec3 col = srgbOut(cLin);
+
+  /* ---- 颗粒 / 抖动 ----
+     8bit 输出的量化台阶在极平滑的渐变上必然显现成"断层"。两层 TPDF 抖动：
+       · 固定 1.2 LSB 那一层专门打散量化（不随颗粒滑块变，关掉颗粒也不会出断层）
+       · 用户颗粒那一层给质感
+     TPDF（两个均匀分布相减 = 三角分布）比单层均匀噪声更有效，
+     且不会像均匀噪声那样在平滑区留下可见的"沙粒感"边缘。 */
+  {
+    vec2 gp = floor(frag / max(uPix, 0.5));
+    float n1 = hash12(gp + uGrainT * 1.7);
+    float n2 = hash12(gp * 1.37 - uGrainT * 2.3 + 41.7);
+    float jitter = (n1 - n2) * (1.2 / 255.0);
+    float n3 = hash12(gp * 2.11 + uGrainT * 3.1);
+    float n4 = hash12(gp * 0.73 - uGrainT * 1.3 + 77.3);
+    float grain = (n3 - n4) * (uGrain * 4.0 / 255.0);
+    col = clamp(col + jitter + grain, 0.0, 1.0);
+  }
+  fragColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(sh);
+    console.error('shader error', log, src);
+    document.body.insertAdjacentHTML('beforeend',
+      `<pre style="position:fixed;left:0;right:0;bottom:0;z-index:99;max-height:40vh;overflow:auto;background:#300;color:#fdd;font:11px monospace;padding:10px">${log}</pre>`);
+    throw new Error(log);
+  }
+  return sh;
+}
+function makeProgram(fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    const log = gl.getProgramInfoLog(p);
+    console.error('link error', log);
+    throw new Error(log);
+  }
+  return p;
+}
+const UNIFORM_NAMES = ['uRes', 'uTime', 'uPix', 'uGrainT', 'uBlobs', 'uBlobB', 'uCount', 'uMap', 'uSoft', 'uSizeK',
+  'uGap', 'uRnd', 'uGrain', 'uVignette', 'uLUT', 'uDebug', 'uAspect',
+  'uFieldGain', 'uWarp', 'uWarpEps', 'uFieldRes', 'uGradMode', 'uGradN', 'uGrad', 'uMix',
+  'uGlass', 'uGlassAmt', 'uGlassSize', 'uGlassHi',
+  'uBlurW', 'uBlurN', 'uBlurWSum'];
+/* 玻璃类型预设表（2026-09 用户要求：选一种玻璃，而不是调四种玻璃）。
+   · amt  折射量：毛玻璃 null = 用 state.frost（它只有一个参数），其余内置 1
+   · haze 雾量（喂给模糊半径）：毛玻璃 null = 用 state.frost（0.6 时半径 = 短边 18% × 0.6），
+          其余是定值 —— 数值等于上一版 0.6 × GLASS_HAZE，所以观感与参考图那一版一致
+   · size / hi 尺寸与高光：type 变化时**写进 state**（state 始终是唯一真值，
+          导出物、GF.state 读到的都是实际生效的值），但没有滑块
+   ⚠️ hi 是"预设单位"，着色器里乘 6 换算到内部系数（见 FS_COMPOSITE 的说明）。 */
+const GLASS = [
+  { name: '毛玻璃', amt: null, haze: null, size: 1.00, hi: 0.00 },
+  { name: '长虹', amt: 1.00, haze: 0.09, size: 1.00, hi: 0.05 },
+  { name: '橘皮', amt: 1.00, haze: 0.27, size: 0.40, hi: 0.13 },
+  { name: '布纹', amt: 1.00, haze: 0.12, size: 0.60, hi: 0.00 },
+  { name: '方格', amt: 1.00, haze: 0.09, size: 0.40, hi: 0.00 },
+];
+const glassK = () => GLASS[state.glassType | 0] || GLASS[0];
+/* 关掉开关 → 三个量全归零：没有折射、没有模糊、没有高光。
+   （比"强度 0"更彻底：模糊趟整个不跑，见 renderFrame 的 radius。） */
+const glassAmtNow = () => !state.glassOn ? 0 : (glassK().amt ?? state.frost);
+const glassHazeNow = () => !state.glassOn ? 0 : (glassK().haze ?? state.frost);
+/* 尺寸/高光由类型预设写进 state —— 切类型、开机、恢复出厂、点 ↺ 都走这里
+   （所以 `apply` 位一律传它：切片头 ↺、尺寸/高光两行的 ↺ 共用同一条"回到本类型预设"的语义）。
+   用户之后拖动滑块即离开默认值，↺ 的 `def` 取值器（见 bindRange 调用处）会自己算出"是否在默认"，
+   因此这里**不需要**再维护一份"这个类型下改过没有"的额外状态 —— 多一个可变标志位，
+   就多一处可能忘了同步的幽灵键（踩坑 35 的教训）。 */
+function applyGlassPreset() {
+  const k = glassK();
+  state.glassSize = k.size;
+  state.glassHi = k.hi;
+}
+/* 只在**类型变化**时套预设（不是每帧/每次 syncUI 都套）：
+   这样 GF.write('glassHi', x) 这类直接改值的路径仍然有效（验收脚本要用它量
+   "高光真的会影响画面"），而切类型时预设一定生效。开机时 lastGlassType = -1
+   → 第一次 syncUI 就把存档里的旧尺寸/高光拉回该类型的预设。 */
+let lastGlassType = -1;
+function syncGlassPreset() {
+  if (state.glassType !== lastGlassType) { applyGlassPreset(); lastGlassType = state.glassType; }
+}
+function makeUniforms(p) {
+  const u = {};
+  for (const n of UNIFORM_NAMES) u[n] = gl.getUniformLocation(p, n);
+  return u;
+}
+const progField = makeProgram(FS_FIELD);
+const progBlur = makeProgram(FS_BLUR);
+const progComposite = makeProgram(FS_COMPOSITE);
+const UF = makeUniforms(progField), UB = makeUniforms(progBlur), UC = makeUniforms(progComposite);
+UB.uFieldTex = gl.getUniformLocation(progBlur, 'uFieldTex');
+UB.uDir = gl.getUniformLocation(progBlur, 'uDir');
+UB.uRadius = gl.getUniformLocation(progBlur, 'uRadius');
+UC.uFieldTex = gl.getUniformLocation(progComposite, 'uFieldTex');
+UC.uFrost = gl.getUniformLocation(progComposite, 'uFrost');
+const U = UC;   // 兼容旧代码里的 U.xxx 写法
+
+/* 离屏场纹理（RGBA16F）：毛玻璃要有真正的低通，单趟着色器里做不到。
+   WebGL2 里 RGBA16F 可渲染需要 EXT_color_buffer_float（下面检查，不支持就走锐利路径）。 */
+const hasFloatRT = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+const rt = { fbo: [gl.createFramebuffer(), gl.createFramebuffer()], tex: [gl.createTexture(), gl.createTexture()], w: 0, h: 0 };
+function allocRT() {
+  for (let i = 0; i < 2; i++) {
+    gl.bindTexture(gl.TEXTURE_2D, rt.tex[i]);
+    if (hasFloatRT) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, rt.w, rt.h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, rt.w, rt.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rt.tex[i], 0);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+/* 离屏纹理尺寸可以小于画布：
+   模糊是低通，在 1/2 或 1/3 分辨率上做，结果按双线性放大回来几乎无差别，
+   而成本按面积下降 4~9 倍 —— 这是这个工具最有效的一处性能优化。
+   实测 3200×2000（Retina 全屏）下模糊趟占 20ms/帧，是全分辨率的锅。 */
+function ensureRT(w, h) {
+  if (rt.w === w && rt.h === h) return true;
+  rt.w = w; rt.h = h;
+  allocRT();
+  return true;
+}
+/* 模糊分辨率：毛玻璃越强，模糊核越大，就越经得起降分辨率。
+   0.6 强度 → 1/2；1.0 强度 → 1/3。上限 1（不放大分辨率）。 */
+/* 场纹理的分辨率倍率。
+   场是低频内容（大色块 + 柔雾），半分辨率双线性放大回来几乎看不出差别，
+   但场趟的成本按面积降 4 倍 —— 而场趟是整个管线最大的开销
+   （每像素要算 3 层噪声梯度 ×7 次哈希 + 10 个色块的距离）。
+   原先 frost=0 时不降分辨率，等于白白多花 4 倍；现在**恒为 1/2 起**。 */
+function blurScaleFor(frost) {
+  if (state._blurScale) return state._blurScale;   // 仅供 A/B 验证：强制场分辨率
+  return frost > 0.85 ? 1 / 3 : 1 / 2;
+}
+const blurScaleNow = () => blurScaleFor(glassHazeNow());   // 雾量（开关 + 类型预设）
+
+/* 片元模糊权重在 CPU 预计算：权重只与 radius 有关，和像素无关。
+   与旧 shader 逐项对应：x=(i-.5)*2、截断 x>radius*4/3+1、σ=max(radius/3,.5)。 */
+const blurWeights = new Float32Array(96);
+function uploadBlurWeights(u, radiusPx) {
+  const sigma = Math.max(radiusPx / 3, 0.5);
+  const inv2s2 = 1 / (2 * sigma * sigma);
+  const maxX = radiusPx * 4 / 3 + 1;
+  let n = 0, wsum = 1;
+  for (let i = 1; i <= 96; i++) {
+    const x = (i - 0.5) * 2;
+    if (x > maxX) break;
+    const w = Math.exp(-x * x * inv2s2);
+    blurWeights[i - 1] = w;
+    wsum += 2 * w;
+    n++;
+  }
+  if (u.uBlurW) gl.uniform1fv(u.uBlurW, blurWeights);
+  if (u.uBlurN) gl.uniform1i(u.uBlurN, n);
+  if (u.uBlurWSum) gl.uniform1f(u.uBlurWSum, wsum);
+}
+
+/* LUT 纹理：512×1 RGBA8，linear 空间，NoColorSpace（着色器自己转 sRGB） */
+const lutTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, lutTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const lutBytes = new Uint8Array(LUT_N * 4);
+function uploadLUT() {
+  for (let i = 0; i < LUT_N * 4; i++) lutBytes[i] = Math.round(clamp01(lut[i]) * 255);
+  gl.bindTexture(gl.TEXTURE_2D, lutTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, LUT_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutBytes);
+}
+
+/* ---------------------------------------------------------- 色块参数生成 */
+/* 位置用黄金比 + 种子抖动撒点：比纯随机更均匀（纯随机会留下大片空白区），
+   又比规则网格有机。每个色块的半径、色带坐标、色相扰动都独立随机。 */
+let blobA = new Float32Array(40), blobB = new Float32Array(40);
+let targetCount = state.count;      // 色块数量过渡用
+const GA = Math.PI * (3 - Math.sqrt(5));
+
+function buildBlobs() {
+  const rng = mulberry32(state.seed);
+  const n = state.count;
+  /* 抖动网格 + 随机镜像（蓝噪声的廉价近似）。
+     之前用黄金角螺旋（t·GA mod 1）撒点：点在中心附近密度天然偏高，
+     多个色块"围住"画面中央 → 场在正中被迫向均值收敛，形成一个局部极值，
+     画面上就是每张图正中都有一小块深色"捏点"（六套配色里全都出现，很显眼）。
+     抖动网格把点均匀铺开，随机镜像让结构不至于每次都是同一套网格。 */
+  const cols = Math.max(1, Math.round(Math.sqrt(n * 1.8)));   // 屏幕是横长的，列多于行
+  const rows = Math.ceil(n / cols);
+  for (let i = 0; i < n; i++) {
+    const cx = i % cols, cy = (i / cols) | 0;
+    let u = (cx + 0.5 + (rng() - 0.5) * 0.9) / cols;
+    let v = (cy + 0.5 + (rng() - 0.5) * 0.9) / rows;
+    if (rng() < 0.5) u = 1 - u;                                // 随机镜像：打散网格的规整感
+    if (rng() < 0.5) v = 1 - v;
+    blobA[i * 4] = -0.02 + u * 1.04;
+    blobA[i * 4 + 1] = -0.12 + v * 1.24;                       // 纵向多铺一点，填满横长画面
+    blobA[i * 4 + 2] = rng();
+    blobA[i * 4 + 3] = 0.40 + rng() * 0.55;                    // 漂移幅度
+    const spread = 0.22 + rng() * 0.34;
+    blobB[i * 4] = 0.55 * state.size * (0.70 + rng() * 0.75) * (0.75 + spread);
+    /* 色带坐标：低差异序列铺满 + 抖动。纯随机会让几个点挤在中间，
+       场就永远够不到色带两端（动态范围只剩中间一截）。 */
+    const uu = (i + 0.5) / n + (rng() - 0.5) * 0.5 / n;
+    blobB[i * 4 + 1] = clamp01(0.075 + uu * 0.85);
+    blobB[i * 4 + 2] = (rng() - 0.5) * 1.2;
+    blobB[i * 4 + 3] = rng();
+  }
+  renderDirty = true;
+}
+function updateBlobRadii() {
+  const rng = mulberry32(state.seed ^ 0x9e37);
+  for (let i = 0; i < state.count; i++) {
+    rng(); rng(); rng(); rng(); rng();          // 跳过位置用的随机数，保持半径与位置一一对应
+    const spread = 0.22 + rng() * 0.34;
+    blobB[i * 4] = 0.55 * state.size * (0.70 + rng() * 0.75) * (0.75 + spread);
+    rng(); rng(); rng();
+  }
+  renderDirty = true;
+}
+
+/* 注：色块位置的 CPU 预计算做过一版，A/B 出现不可接受的画面差异，已回退；
+   目前仍由 GLSL 的 blobPos() 每像素计算，留待单独调校。 */
+
+/* ---------------------------------------------------------- 渲染循环 */
+let vw = 2, vh = 2, tNow = 0, tSim = 0, last = 0, grainStep = 0, frames = 0, rafId = 0;
+let renderDirty = true;
+let cur = { size: state.size, rnd: state.rnd, map: state.map, soft: state.soft };
+const frameCbs = [];
+
+/* 自适应分辨率：帧时间持续偏高时自动降低渲染倍率，恢复后慢慢加回来。
+   为什么需要它：窗口越大、屏幕 dpr 越高，像素越多；4K/5K 屏上即使是
+   很省的管线也可能吃满 GPU。这是兜底，不是主要手段（主要手段是模糊趟降分辨率）。
+   只有"用户没手动改过画质"时才介入，避免跟用户的显式选择打架。 */
+const adapt = { cur: 0, samples: [], down: 0, upAt: 0, warned: false };
+function adaptTick(ms) {
+  if (!state.adaptive) return;
+  const q = state.quality * Math.pow(0.72, adapt.down);
+  if (Math.abs(q - adapt.cur) > 1e-3) {
+    adapt.cur = q;
+    canvas.width = 0;                      // 强制 resize 生效
+    resize();
+  }
+  if (ms <= 0 || ms > 200) return;         // 忽略切标签页之类的大间隔
+  adapt.samples.push(ms);
+  if (adapt.samples.length < 40) return;
+  adapt.samples.sort((a, b) => a - b);
+  const med = adapt.samples[adapt.samples.length >> 1];
+  adapt.samples.length = 0;
+  const now = performance.now();
+  if (med > 22 && adapt.down < 3) {        // 明显跟不上 60fps → 降一档
+    adapt.down++; adapt.upAt = now + 8000; adapt.cur = -1;
+    if (!adapt.warned) { adapt.warned = true; toast(tr('tAutoQuality')); }
+  } else if (med < 13 && adapt.down > 0 && now > adapt.upAt) {
+    adapt.down--; adapt.cur = -1;          // 有余量 → 慢慢加回来
+  }
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2) * state.quality * Math.pow(0.72, adapt.down);
+  const w = Math.max(2, Math.round(innerWidth * dpr)), h = Math.max(2, Math.round(innerHeight * dpr));
+  if (w === canvas.width && h === canvas.height) return;
+  canvas.width = w; canvas.height = h;
+  vw = w; vh = h;
+  gl.viewport(0, 0, w, h);
+  ensureRT(w, h);
+  renderDirty = true;
+  panelASkip = true;   // 画布刚重建：下一次取样不可信，跳过
+}
+
+/* 把当前参数灌进某个程序的 uniform。三个程序共用同一套 uniform 名，
+   所以只写一份；uLUT / uFieldTex 这类各自独有的在后面单独设。 */
+/* rw/rh = 这一趟自己的渲染分辨率（模糊趟可能小于画布）。
+   uRes 必须用各自的分辨率：着色器里 uv = (gl_FragCoord - 0.5*uRes)/uRes.y，
+   用错了会让场在缩放分辨率下算错位置，整幅画面偏移。
+   uAspect 一律用**画布**宽高比（视觉比例），与场纹理尺寸无关。 */
+/* 启动自检：着色器里声明的 uniform 必须都有来源。
+   漏一个的后果是它静默保持默认值（vec2 就是 0,0）——曾把 uFieldRes 漏掉，
+   合成着色器里 texel = 1/0 = Inf，画面直接塌成一片灰，却不报任何错。
+   以后再加 uniform，这里会立刻抓到。 */
+/* 启动自检之二：顶层 function/const/let 重复定义会静默覆盖（后者赢），
+   这类错误语法完全合法、控制台也不报，只在运行时表现成"改了没用"。
+   同一个坑已经踩过三次（GF.raw 重复键、normalizeCurve 重复定义、uField 同名），
+   所以直接在启动时扫出来。 */
+function auditDuplicates() {
+  const src = document.currentScript ? document.currentScript.textContent : '';
+  if (!src) return;
+  const seen = new Map();
+  const re = /^(?:function\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=)/gm;
+  for (const m of src.matchAll(re)) {
+    const name = m[1] || m[2];
+    if (seen.has(name)) window.__gfErrors.push(`顶层「${name}」重复定义（后一个会覆盖前一个）`);
+    seen.set(name, 1);
+  }
+}
+
+function auditUniforms() {
+  const common = new Set(UNIFORM_NAMES);
+  const perPass = new Set(['uFieldTex', 'uDir', 'uRadius', 'uFrost', 'uFieldRes', 'uLUT']);
+  ['FS_FIELD', 'FS_BLUR', 'FS_COMPOSITE'].forEach(name => {
+    const src = { FS_FIELD, FS_BLUR, FS_COMPOSITE }[name];
+    for (const m of src.matchAll(/uniform\s+\w+\s+(\w+)\s*(?:\[\d+\])?\s*;/g)) {
+      const u = m[1];
+      if (!common.has(u) && !perPass.has(u)) {
+        window.__gfErrors.push(`${name} 的 uniform「${u}」没有登记，会静默保持默认值`);
+      }
+    }
+  });
+}
+
+function setUniforms(u, rw, rh) {
+  gl.uniform2f(u.uRes, rw, rh);
+  if (u.uFieldRes) gl.uniform2f(u.uFieldRes, rt.w, rt.h);   // 场纹理实际尺寸（可能低于画布）
+  gl.uniform1f(u.uAspect, vw / Math.max(1, vh));
+  gl.uniform1f(u.uTime, tSim);
+  gl.uniform1f(u.uGrainT, grainStep);
+  gl.uniform1f(u.uPix, Math.min(devicePixelRatio || 1, 2));
+  gl.uniform4fv(u.uBlobs, blobA);
+  gl.uniform4fv(u.uBlobB, blobB);
+  gl.uniform1i(u.uCount, state.count);
+  gl.uniform1f(u.uMap, cur.map);
+  gl.uniform1f(u.uSoft, cur.soft);
+  gl.uniform1f(u.uSizeK, cur.size * cur.size);   // 色块大小 → 权重分离度（K 整体随之缩放）
+  gl.uniform1f(u.uGap, state.gap);
+  gl.uniform1f(u.uRnd, cur.rnd);
+  gl.uniform1f(u.uGrain, state.grain);
+  gl.uniform1f(u.uVignette, state.vin);
+  gl.uniform1i(u.uDebug, state._dbg | 0);
+  gl.uniform1f(u.uFieldGain, state.field);
+  gl.uniform1f(u.uWarp, state.warp);
+  gl.uniform1f(u.uWarpEps, state.warpEps);
+  if (u.uGradMode) {
+    gl.uniform1f(u.uMix, state.colMix);
+    gl.uniform1i(u.uGradMode, state.gradMode);
+    gl.uniform1i(u.uGradN, gradStops.n);
+    gl.uniform3fv(u.uGrad, gradStops.arr);
+  }
+  /* 玻璃只在合成趟里存在（另两趟的 location 是 null，跳过）。
+     强度/雾是派生的（开关 + 类型 + frost），尺寸/高光是类型预设写进 state 的值。 */
+  if (u.uGlass) {
+    gl.uniform1i(u.uGlass, state.glassType | 0);
+    gl.uniform1f(u.uGlassAmt, glassAmtNow());
+    gl.uniform1f(u.uGlassSize, state.glassSize);
+    gl.uniform1f(u.uGlassHi, state.glassHi);
+  }
+}
+function bindTex(unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+function renderFrame() {
+  /* 毛玻璃半径按"逻辑像素"给，再乘 dpr 换算到渲染像素 ——
+     这样"流畅/标准/高清"三档切换不会改变观感上的模糊程度。
+     半径 < 0.6 时跳过两次模糊趟（场纹理保持原样），只多一趟全屏绘制。 */
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  /* 半径按"逻辑像素"给：0~1 映射到 0~画面短边的 18%。
+     一开始写死 26px，实测几乎看不出效果 —— 模糊半径必须与画面尺度相关：
+     26px 的核施加在跨 280px 的渐变上只改变 1~2 级，等于没做。
+     18% 短边在 1080p 上约 190px，macrot 上刚好把色块边界化开成柔雾。
+     2026-09：雾量改成 glassHazeNow()（开关 + 类型预设）—— 关掉开关时是 0，
+     半径 < 0.6 → 模糊趟整个跳过，这才是"完全没有玻璃"。 */
+  const radius = glassHazeNow() * 0.18 * Math.min(vw / dpr, vh / dpr) * dpr * Math.max(0.5, state.quality);
+  const doBlur = radius >= 0.6;
+
+  /* 没有浮点离屏能力时退回"画布直出 + 不做模糊"（极老设备），
+     至少画面是对的，只是没有毛玻璃。 */
+  if (!hasFloatRT) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, vw, vh);
+    gl.useProgram(progComposite);
+    setUniforms(UC, vw, vh);
+    bindTex(0, lutTex); gl.uniform1i(UC.uLUT, 0);
+    bindTex(1, lutTex); gl.uniform1i(UC.uFieldTex, 1);   // 退化：直接查色带
+    gl.uniform1f(UC.uFrost, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    frames++;
+    return;
+  }
+
+  const bs = blurScaleFor(glassHazeNow());
+  const bw = Math.max(2, Math.round(vw * bs)), bh = Math.max(2, Math.round(vh * bs));
+  ensureRT(bw, bh);
+  // ① 场 → rt0（按缩放后的尺寸算；场本身是低频的，降分辨率看不出来）
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[0]);
+  gl.viewport(0, 0, bw, bh);
+  gl.useProgram(progField);
+  setUniforms(UF, bw, bh);
+  bindTex(0, lutTex); gl.uniform1i(UF.uLUT, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // ② 可分离高斯：横向 rt0 → rt1，纵向 rt1 → rt0（半径与方向都按缩放后的像素换算）
+  if (doBlur) {
+    gl.useProgram(progBlur);
+    setUniforms(UB, bw, bh);
+    bindTex(0, rt.tex[0]); gl.uniform1i(UB.uFieldTex, 0);
+    gl.uniform1f(UB.uRadius, radius * bs);
+    uploadBlurWeights(UB, radius * bs);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[1]);
+    gl.uniform2f(UB.uDir, 1, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    bindTex(0, rt.tex[1]);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[0]);
+    gl.uniform2f(UB.uDir, 0, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // ③ 合成 → 画布
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, vw, vh);
+  gl.useProgram(progComposite);
+  setUniforms(UC, vw, vh);                 // 内部会按 rt 实际尺寸设 uFieldRes
+  bindTex(0, lutTex); gl.uniform1i(UC.uLUT, 0);
+  bindTex(1, rt.tex[0]); gl.uniform1i(UC.uFieldTex, 1);
+  gl.uniform1f(UC.uFrost, doBlur ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  renderFrame._radius = radius;
+  frames++;
+}
+
+let visPaused = false;
+document.addEventListener('visibilitychange', () => {
+  // 切到后台就不画了（省电、省 GPU），回来重置计时避免一帧巨大的 dt
+  visPaused = document.hidden;
+  last = 0;
+});
+
+function frame(now) {
+  rafId = requestAnimationFrame(frame);
+  if (visPaused) { last = now; return; }
+  if (exporting) { last = now; return; }
+  const rawDt = last ? now - last : 0;
+  const pw = vw, ph = vh;
+  resize();
+  /* 刚重建过画布缓冲 → 这一帧的内容不可信，跳过取样（否则会读到空白，玻璃白透一档） */
+  if (vw !== pw || vh !== ph) panelASkip = true;
+  glassTick(now);          // ★ 必须在 renderFrame() 之前：见 glassTick 上方注释①
+  if (last) adaptTick(rawDt);
+  const dt = last ? Math.min(0.05, rawDt / 1000) : 0;
+  last = now;
+  if (!state.paused) tSim += dt * state.speed;
+
+  // 参数平滑：拖滑块时画面"呼吸"过去而不是跳过去（色块数量除外——它只能整数跳变）
+  const k = 1 - Math.pow(0.001, dt);
+  cur.size = lerp(cur.size, state.size, k);
+  cur.rnd = lerp(cur.rnd, state.rnd, k);
+  cur.map = lerp(cur.map, state.map, k);
+  cur.soft = lerp(cur.soft, state.soft, k);
+  if (targetCount !== state.count) { targetCount = state.count; buildBlobs(); }
+
+  if (!state.paused) grainStep = Math.floor(tSim * 24);
+  /* 暂停/静止时不再每帧重画：画面完全没变时，60fps 只是白烧 GPU。
+     参数平滑还没收敛（smoothing）或刚改过参数（renderDirty）时继续画。 */
+  const smoothing = Math.abs(cur.size - state.size) > 1e-3
+    || Math.abs(cur.rnd - state.rnd) > 1e-3
+    || Math.abs(cur.map - state.map) > 1e-3
+    || Math.abs(cur.soft - state.soft) > 1e-3;
+  if (!state.paused || renderDirty || smoothing) {
+    renderFrame();
+    renderDirty = false;
+  }
+  for (let i = frameCbs.length - 1; i >= 0; i--) frameCbs[i]();
+  hudTick(now);
+}
+
+/* 暂停时也要能导出：画布内容靠 preserveDrawingBuffer 保住，这里不额外做事 */
+
+/* ------------------------------------------------- 面板玻璃浓度自适应（2026-10-03 第 2 轮）
+   用户反馈："两侧 UI 底部的黑色底板在渐变背景上不和谐，改成参考图这种透明玻璃材质更强的效果"。
+   素材：reference/玻璃UI材质参考.jpg（浅色毛玻璃卡片：强背景模糊 + 1px 亮边 + 内上沿高光）。
+
+   ⚠️ 为什么浓度必须**动态**算，不能写死一个更小的透明度：
+   面板一旦变透明，文字对比度就不再由面板决定，而取决于**面板底下那片画布有多亮**。
+   --ink-2（标签色 #9c9c9c，线性亮度 .3245）要保住 AA 的 4.5:1，合成后的面板亮度
+   必须 ≤ 50（sRGB 0~255）。反推所需浓度：
+       合成亮度 = a×10 + (1-a)×bg  ≤ 50        →   a ≥ (bg - 50) / (bg - 10)
+   · bg = 255（雾白/沙金那种白底）   → a ≥ .84 —— 也就是说**写死任何一个小于 .84 的值，
+     在浅色预设上标签都会掉到 4.5:1 以下**，而写死 .84 又跟原来的 .90 几乎没有区别，
+     等于没改（用户要的"更强透明"就落空了）。
+   · bg = 19（用户新加的"曜石"，实测）→ 下限 .20，玻璃几乎全透。
+   所以按实测底亮度在 [.20, .88] 之间取值：暗背景极透、亮背景自动坐实。
+   对一个"背景一直在流动、明暗都在变"的工具，这是唯一既满足观感又不砸掉可读性的做法。
+
+   取样的代价与规避（这一步很关键，不然每取样一次就卡一帧）：
+   gl.readPixels 会**强制等 GPU 把当前帧画完**再返回。所以：
+   ① **在 frame() 的最开头读**（发出本帧任何 GL 命令之前）—— 此时上一帧早已画完、
+      GPU 是闲的，readPixels 没什么可等；读到的是上一帧的画面，而玻璃浓度是慢变量，
+      差一帧完全无所谓。（放在 renderFrame() 之后读，就变成"等自己刚发的那一帧"，
+      在软件渲染下实测吃掉 31% 帧率。改成开头读之后同一个测法回到噪声以内。）
+   ② 节流到 1.2s；底图几乎没动（暂停、或变化很慢）就逐步退避到 4s。
+   ③ 值按 dt 做半衰期 0.22s 的平滑，避免边界抖动。
+   实测数字见 README「面板玻璃」一节。 */
+const PANEL_A_MIN = 0.20, PANEL_A_MAX = 0.88, PANEL_LUM_TARGET = 50;
+let panelA = PANEL_A_MAX;          // 当前浓度（首帧取保守值：先实一点，不能先花掉）
+let panelATarget = PANEL_A_MAX;    // 目标浓度
+let panelABg = null;               // 最近一次实测的底亮度（0~255）
+let panelAForce = null;            // 测试/对照出图用：钉死浓度，不参与自适应
+let panelANext = 0;                // 下次取样的时间
+let panelALastT = 0;               // 上一次 glassTick 的时间戳（算 dt，做帧率无关的平滑）
+let panelAEvery = 1600;            // 取样间隔。底图没变就逐步退避到 4s（暂停看画面时几乎不读）
+let panelASkip = false;            // 上一帧刚重建过画布缓冲 → 这帧的内容不可信，跳过
+const PANEL_EVERY_MIN = 1600, PANEL_EVERY_MAX = 4000;
+
+const panelAForBg = bg => Math.min(PANEL_A_MAX, Math.max(PANEL_A_MIN, (bg - PANEL_LUM_TARGET) / Math.max(1, bg - 10)));
+
+/* 在"面板底下"那片画布上取平均亮度：每个可见面板取 3 条 1px 高的横线（上/中/下）。
+   画布像素与 CSS 像素可能不同尺度（quality < 1 时画布更小），所以用 vw/innerWidth 换算，
+   不假定 dpr。GL 的 y 轴朝上，所以要翻过来。 */
+function samplePanelBackdrop() {
+  const sx = vw / Math.max(1, innerWidth), sy = vh / Math.max(1, innerHeight);
+  let sum = 0, n = 0;
+  for (const id of ['panelL', 'panelR']) {
+    const el = $(id);
+    if (!el || el.classList.contains('collapsed')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    const x0 = Math.max(0, Math.round(r.left * sx));
+    const x1 = Math.min(vw, Math.round(r.right * sx));
+    const w = x1 - x0;
+    if (w < 8) continue;
+    const buf = new Uint8Array(w * 4);
+    for (const f of [0.10, 0.5, 0.90]) {
+      const cy = Math.min(vh - 1, Math.max(0, Math.round((r.top + r.height * f) * sy)));
+      gl.readPixels(x0, vh - 1 - cy, w, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      for (let i = 0; i < w; i++) {
+        sum += buf[i * 4] * 0.2126 + buf[i * 4 + 1] * 0.7152 + buf[i * 4 + 2] * 0.0722;
+        n++;
+      }
+    }
+  }
+  return n ? sum / n : null;
+}
+
+/* 只在 frame() 的最开头调用（见上面注释①） */
+function glassTick(now) {
+  if (panelAForce !== null) {                       // 对照出图：钉死，不取样
+    if (panelA !== panelAForce) { panelA = panelAForce; applyPanelA(); }
+    return;
+  }
+  if (panelASkip) { panelASkip = false; }
+  else if (now >= panelANext && typeof gl !== 'undefined' && gl && !gl.isContextLost()) {
+    panelANext = now + panelAEvery;
+    const bg = samplePanelBackdrop();
+    if (bg !== null) {
+      /* 底图几乎没动（暂停 / 变化很慢）→ 把下一次取样往后推；一动就回到最短间隔 */
+      panelAEvery = Math.abs(bg - (panelABg ?? -999)) < 1.5
+        ? Math.min(PANEL_EVERY_MAX, panelAEvery * 2)
+        : PANEL_EVERY_MIN;
+      panelABg = bg; panelATarget = panelAForBg(bg);
+    }
+  }
+  /* 平滑跟随：半衰期 0.22s 的指数逼近，**按 dt 算**而不是"每帧走固定比例" ——
+     本项目其它平滑（cur.size 等）就是按 dt 的，理由一样：软件渲染下只有 2fps，
+     按帧走的话 2.5 秒都靠不到目标（实测 obsidian 目标 .20、2.5 秒后还停在 .56）。 */
+  const t = now || performance.now();
+  const dt = panelALastT ? Math.min(0.5, (t - panelALastT) / 1000) : 0;
+  panelALastT = t;
+  if (Math.abs(panelATarget - panelA) > 0.001) {
+    panelA += (panelATarget - panelA) * (1 - Math.pow(0.5, dt / 0.22));
+    applyPanelA();
+  } else if (panelA !== panelATarget) {
+    panelA = panelATarget; applyPanelA();
+  }
+}
+function applyPanelA() {
+  document.documentElement.style.setProperty('--panel-a', panelA.toFixed(3));
+}
+
+/* ---------------------------------------------------------- HUD */
+let fpsT = 0, fpsN = 0, fps = 0;
+function hudTick(now) {
+  fpsN++;
+  if (now - fpsT > 500) { fps = Math.round(fpsN * 1000 / (now - fpsT)); fpsT = now; fpsN = 0; }
+  const hud = $('hud');
+  if (hud.classList.contains('on')) {
+    const scale = (state.quality * Math.pow(0.72, adapt.down));
+    /* 暂停时不再渲染，rAF 仍然在跑 —— 不能再显示 60fps 骗人。 */
+    const fpsTxt = state.paused ? tr('pause') : `${fps}fps`;
+    const msTxt = state.paused ? '—' : `${(1000 / Math.max(1, fps)).toFixed(1)}ms`;
+    hud.textContent = `${vw}×${vh} · ${fpsTxt} · ${msTxt}`
+      + (adapt.down ? ` · 自适应 ×${scale.toFixed(2)}` : '') + ` · seed ${state.seed}`;
+  }
+}
+
+/* ============================================================ 9. 控件接线 */
+
+/* 出厂默认值快照：↺ 重置回到的是**这里**，不是"上次打开时保存的值"。
+   工具类UI风格里这条是硬要求——试错成本必须为零。 */
+const DEFAULTS = Object.freeze({ ...state });
+const resetBtns = [];        // { btn, get, def, apply }
+
+/* ↺ 按钮：悬停参数行才显形；已在默认值时更淡且不可点（.at-default）。
+   rowEl 可以是参数行本身，也可以是整个分组体（此时取其中第一个带 .val 的行）。
+   注意：参数行本身就是 .row —— 早先写成 rowEl.querySelector('.row') 恒为 null，
+   于是十几个滑块只剩两个侥幸挂上（那俩传的是 .sec-body），排查了很久。
+   def：可选的"当前默认值"取值器。玻璃的尺寸/高光**每种类型各有自己的默认值**
+   （长虹 1.00/0.05、橘皮 0.40/0.13 …），所以这两行的 ↺ 必须回到**当前类型的默认**，
+   而不是 DEFAULTS 里那个全局值 —— 否则在橘皮下点 ↺ 会跳到 1.00/0.00，
+   那是长虹和毛玻璃的数，对橘皮毫无意义。 */
+function attachReset(rowEl, key, apply, def) {
+  const head = rowEl.classList.contains('row') ? rowEl : rowEl.querySelector('.row');
+  if (!head) return;
+  const val = head.querySelector('.val');
+  if (!val) return;
+  const btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'rv'; btn.textContent = '↺';
+  btn.title = tr('tReset')(key);
+  btn.setAttribute('aria-label', `重置 ${key}`);
+  btn.addEventListener('click', () => {
+    state[key] = def ? def() : DEFAULTS[key];
+    if (apply) apply();
+    syncUI(); saveSoon();
+  });
+  /* 插到参数名（.lab）之后、读数之前 —— 读数保持最右对齐。
+     显式用 val 做参照物，不用 lab.nextSibling：参数行跨行书写时
+     它是个空白文本节点，位置虽然一样，但读起来会以为插错了地方。 */
+  head.insertBefore(btn, val);
+  resetBtns.push({ btn, key, def, apply });
+}
+function refreshResets() {
+  for (const r of resetBtns) {
+    const same = r.def ? Math.abs((state[r.key] ?? 0) - r.def()) < 1e-9
+      : (r.get ? r.get() : Math.abs((state[r.key] ?? 0) - DEFAULTS[r.key]) < 1e-9);
+    r.btn.classList.toggle('at-default', same);
+  }
+}
+
+function bindRange(id, key, labelId, digits, after, def) {
+  const el = $(id), lab = labelId ? $(labelId) : null;
+  /* 控件可能已被移除（改版时 HTML 删了、JS 还在绑）——返回空壳，
+     别让一句 addEventListener 把整个模块后半段炸掉。 */
+  if (!el) { console.warn('bindRange: 找不到控件', id); return { el: null, sync: () => { } }; }
+  const paint = () => {
+    const p = (el.value - el.min) / (el.max - el.min) * 100;
+    el.style.setProperty('--p', p.toFixed(2) + '%');
+  };
+  const upd = () => {
+    state[key] = parseFloat(el.value);
+    if (lab) lab.textContent = digits === 2 ? fmt(state[key], 2) : fmt(state[key], digits);
+    paint();
+  };
+  el.addEventListener('input', () => { upd(); if (after) after(); saveSoon(); refreshResets(); renderDirty = true; });
+  upd();
+  const scope = el.closest('.sec-body');
+  if (scope) {
+    /* 取"最后一个排在滑块之前的 .row"——也就是紧邻它上面那一行。
+       早先用 find() 取的是**第一个**满足条件的行，于是同一分组里
+       多个滑块的 ↺ 会全部挤到最上面那一行；而"取色范围"那组没有更靠前的行，
+       find 返回 undefined，下一句 hiReset.key = null 直接抛错，
+       整个模块后半段（键盘快捷键、分区折叠）就再也没执行 —— 一个定位写错，
+       表现成"键盘完全没反应"，绕了很久。 */
+    const row = [...scope.children]
+      .filter(r => r.classList.contains('row') && r.querySelector('.val')
+        && (r.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .pop();
+    if (row) attachReset(row, key, after, def);
+  }
+  /* sync() 是"外部改了 state，把控件拉回来"的唯一入口（键盘快捷键、
+     GF.write、GF.resetAll、载入存档都走它）。这里必须顺带刷新 ↺ 的显隐，
+     否则按方向键改了值、滑块动了，↺ 还停在"默认"的淡态 ——
+     用户看到的正是"调完参数 ↺ 反而没了"（第二个成因，2026-09 修）。 */
+  return { el, sync: () => { el.value = state[key]; upd(); refreshResets(); renderDirty = true; } };
+}
+
+const ctl = {};
+ctl.speed = bindRange('speed', 'speed', 'vSpeed', 2);
+ctl.size = bindRange('size', 'size', 'vSize', 2, updateBlobRadii);
+ctl.rnd = bindRange('rnd', 'rnd', 'vRnd', 2);
+ctl.grain = bindRange('grain', 'grain', 'vGrain', 2);
+ctl.vin = bindRange('vin', 'vin', 'vVin', 2);
+ctl.soft = bindRange('soft', 'soft', 'vSoft', 2);
+ctl.warp = bindRange('warp', 'warp', 'vWarp', 2);
+ctl.frost = bindRange('frost', 'frost', 'vFrost', 2);
+/* 玻璃尺寸/高光：滑块是**可调的**，默认值随类型走。
+   · def = 当前类型的预设值 → ↺ 回到的是"这种玻璃该有的值"（不是全局默认）
+   · 签名同 bindRange(id, key, labelId, digits, after, def)
+   ⚠️ 这里**不能**把 applyGlassPreset 当 after 传：after 是在 upd() **之后**跑的，
+   而 applyGlassPreset 会把 state 写回类型预设 —— 于是每拖一格都被默认值覆盖，
+   滑块显示动了、state 纹丝不动（实测踩过：读数 2.40、state 仍是 1.00）。 */
+ctl.glassSize = bindRange('glassSize', 'glassSize', 'vGlassSize', 2, null, () => glassK().size);
+ctl.glassHi = bindRange('glassHi', 'glassHi', 'vGlassHi', 2, null, () => glassK().hi);
+ctl.gap = bindRange('gap', 'gap', 'vGap', 2);
+ctl.bri = bindRange('bri', 'bri', 'vBri', 2, rebuildLUT);
+ctl.con = bindRange('con', 'con', 'vCon', 2, rebuildLUT);
+ctl.sat = bindRange('sat', 'sat', 'vSat', 2, rebuildLUT);
+ctl.hueS = bindRange('hueS', 'hueShift', 'vHueS', 0, rebuildLUT);
+ctl.dur = bindRange('dur', 'dur', 'vDur', 1);
+
+
+$('count').addEventListener('input', e => {
+  state.count = parseInt(e.target.value, 10);
+  $('vCount').textContent = state.count;
+  e.target.style.setProperty('--p', (state.count - 2) / 8 * 100 + '%');
+  buildBlobs(); saveSoon(); refreshResets();
+});
+$('count').style.setProperty('--p', (state.count - 2) / 8 * 100 + '%');
+attachReset($('vCount').closest('.row'), 'count', () => buildBlobs());   // 明确挂到「色块数量」那一行
+
+
+/* 折叠分区：点标题整组收起/展开 */
+document.querySelectorAll('.sec-head').forEach(h => {
+  const sec = h.parentElement;
+  h.setAttribute('aria-expanded', sec.classList.contains('open') ? 'true' : 'false');
+  h.addEventListener('click', () => {
+    sec.classList.toggle('open');
+    h.setAttribute('aria-expanded', sec.classList.contains('open') ? 'true' : 'false');
+  });
+});
+
+/* 画质 / 导出尺寸 */
+$('qSeg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-q]'); if (!b) return;
+  state.quality = parseFloat(b.dataset.q);
+  adapt.down = 0; adapt.cur = 0;          // 用户显式选了画质 → 重置自适应倍率
+  [...$('qSeg').children].forEach(x => x.classList.toggle('on', x === b));
+  canvas.width = 0; canvas.height = 0; resize(); saveSoon();
+});
+$('sizeSeg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-sz]'); if (!b) return;
+  const [w, h] = b.dataset.sz.split('x').map(Number);
+  state.outW = w; state.outH = h;
+  [...$('sizeSeg').children].forEach(x => x.classList.toggle('on', x === b));
+  $('vOutSize').textContent = `${w}×${h}`; saveSoon();
+});
+
+/* 玻璃类型：毛玻璃（纯模糊）/ 长虹 / 橘皮 / 布纹 / 方格。
+   类型不是数值参数，所以 ↺ 要手动挂（挂法同「色块数量」那一行）。
+   2026-09：切类型时把该类型的尺寸/高光默认值写进 state（applyGlassPreset），
+   这两个值**有滑块、可继续调**，↺ 回到的是当前类型的默认。 */
+$('glassSeg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-glass]'); if (!b) return;
+  state.glassType = parseInt(b.dataset.glass, 10);
+  applyGlassPreset();
+  syncUI(); saveSoon();
+});
+attachReset($('vGlass').closest('.row'), 'glassType', null);
+
+/* 玻璃总开关：关掉就是完全没有玻璃（折射/模糊/高光全归零，模糊趟不跑）。
+   ⚠️ 开关这种控件是「工具类UI风格」里明确不用的（技能规范第 6 条），
+   是用户 2026-09 点名要的，属于有意偏离 —— 详见 styles.css 的 .sw 注释。 */
+$('glassSw').addEventListener('click', () => {
+  state.glassOn = !state.glassOn;
+  if (state.glassOn) applyGlassPreset();     // 打开时把当前类型的预设补齐
+  syncUI(); saveSoon();
+});
+
+/* 配色现在只有一条来源：图片取色（左面板 01）。
+   下面这个函数只剩"把某条内置色标装进色带"的作用 —— 没有图片时用来给一个
+   黑白起点，以及验收脚本用来重置状态。界面上不再有配色按钮（用户不需要
+   在图片取色之外再挑颜色，那只会让"取到的颜色跟图片不一致"）。 */
+/* 预设按钮：色块上直接画出色带的渐变，一眼能挑 */
+(function buildPresets() {
+  const wrap = $('presets'); if (!wrap) return;
+  PRESETS.forEach(p => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'preset'; b.dataset.id = p.id;
+    b.title = presetName(p);
+    const i = document.createElement('i');
+    i.style.background = `linear-gradient(100deg, ${p.stops.join(',')})`;
+    const sp = document.createElement('span'); sp.textContent = presetName(p);
+    b.append(i, sp);
+    b.addEventListener('click', () => { applyPreset(p.id); saveSoon(); });
+    wrap.appendChild(b);
+  });
+})();
+/* 切语言时只换按钮上的名字 / title，不重建按钮（重建会把 ::hover / 焦点态清掉） */
+function renderPresetNames() {
+  const wrap = $('presets'); if (!wrap) return;
+  PRESETS.forEach(p => {
+    const b = wrap.querySelector(`.preset[data-id="${p.id}"]`); if (!b) return;
+    b.title = presetName(p);
+    const sp = b.querySelector('span'); if (sp) sp.textContent = presetName(p);
+  });
+}
+
+function setPresetActive(id) {
+  state.preset = id;
+  const wrap = $('presets');
+  if (wrap) [...wrap.children].forEach(b => b.classList.toggle('on', b.dataset.id === id));
+}
+/* 预设 → 色带（预设的色标顺序就是画面上的顺序） */
+function applyPreset(id) {
+  const p = PRESETS.find(x => x.id === id); if (!p) return;
+  setRawFromStops(p.stops);
+  swatchOff.fill(0);
+  setPresetActive(id);
+  rebuildLUT();
+}
+
+/* 取样线辅助按钮 */
+/* 换构图 / 暂停 */
+$('reseed').addEventListener('click', () => {
+  state.seed = (Math.random() * 1e9) | 0;
+  buildBlobs(); saveSoon(); toast(tr('tReseeded'));
+});
+function setPaused(p) {
+  state.paused = p;
+  renderDirty = true;
+  $('pause').textContent = p ? tr('play') : tr('pause');
+  $('pause').classList.toggle('primary', p);
+  saveSoon();
+}
+$('pause').addEventListener('click', () => setPaused(!state.paused));
+addEventListener('keydown', e => {
+  /* 只放过"真的在输入文字"的控件。早先一刀切 /input|textarea/，
+     结果鼠标拖过滑块后焦点留在 <input type=range> 上，方向键全被吞掉
+     （真人操作也会这样，不只是测试问题）。 */
+  const t = e.target;
+  if (t && (t.tagName === 'TEXTAREA' || t.isContentEditable
+    || (t.tagName === 'INPUT' && !/^(range|checkbox|radio|button|submit|color)$/.test(t.type)))) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  /* 统一用小写比较。踩过：switch 里用了 toLowerCase()，分支里却拿原始大小写
+     （'ArrowRight'）去比，于是左右/上下完全反向 —— 按右反而变小。 */
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  switch (k) {
+    case ' ': e.preventDefault(); setPaused(!state.paused); break;   // 阻止空格"点击"刚按过的按钮
+    case 'h': case 'H': setPanelsHidden(!panelsHidden()); break;
+    case 'r': case 'R': $('reseed').click(); break;
+    case 'g': case 'G': state.grain = state.grain > 0.04 ? 0 : 0.22; ctl.grain.sync(); saveSoon(); break;
+    case 'p': case 'P': exportStill(); break;
+    case 'Tab': e.preventDefault(); setPanelsHidden(!panelsHidden()); break;
+    case 'ArrowLeft': case 'ArrowRight': {
+      const d = k === 'ArrowRight' ? 0.05 : -0.05;
+      state.speed = clamp(state.speed + d, 0, 2); ctl.speed.sync(); saveSoon();
+      toast(`${tr('tSpeed')} ${fmt(state.speed, 2)}`); break;
+    }
+    case 'ArrowUp': case 'ArrowDown': {
+      const d = k === 'ArrowUp' ? 0.05 : -0.05;
+      state.size = clamp(state.size + d, 0.45, 3); ctl.size.sync(); updateBlobRadii(); saveSoon();
+      toast(`${tr('tSize')} ${fmt(state.size, 2)}`); break;
+    }
+  }
+});
+
+/* 面板收起 / 展开：一个按钮控两侧（particle-pointcloud 的做法），
+   收起后右下角出现一个"面板"chip 唤回。 */
+let uiHidden = false;
+function setPanelsHidden(hidden) {
+  uiHidden = hidden;
+  $('panelL').classList.toggle('collapsed', hidden);
+  $('panelR').classList.toggle('collapsed', hidden);
+  $('toggleBtn').classList.toggle('show', hidden);
+  syncMini();
+}
+const panelsHidden = () => $('panelL').classList.contains('collapsed');
+$('collapseAll').addEventListener('click', () => setPanelsHidden(true));
+$('toggleBtn').addEventListener('click', () => setPanelsHidden(false));
+
+function syncMini() {
+  $('hud').classList.toggle('on', panelsHidden());   // HUD 只在收起面板时显示
+}
+
+/* ============================================================ 9.5 语言切换
+   实现方式照抄 particle-pointcloud（用户 2026-09 夜间任务指定"参照它的实际实现"）：
+     bindSeg(段控 id, 隐藏 select id) —— 段控只负责外观，真值源是那个 select；
+     applyLang() —— 三通道静态替换（data-i18n / -title / -aria）＋ 调用 refresh* 重算动态文案。 */
+function bindSeg(segId, selId) {
+  const seg = $(segId), sel = $(selId);
+  if (!seg || !sel) return;
+  const sync = () => Array.from(seg.children).forEach(b => {
+    const on = b.dataset.val === sel.value;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  seg.addEventListener('click', e => {
+    const b = e.target.closest('button[data-val]');
+    if (!b || sel.disabled || sel.value === b.dataset.val) return;
+    sel.value = b.dataset.val;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    sync();
+  });
+  sel.addEventListener('change', sync);
+  sync();
+  return sync;
+}
+/* 语言变了要重算的"动态文案"（静态的走 data-i18n，不用管） */
+function refreshI18NText() {
+  syncUI();                 // 画质读数、导出按钮文字、玻璃类型名、时长……
+  renderPresetNames();
+  refreshSwatchLabels();
+  setPaused(state.paused);  // 暂停 / 播放按钮
+  updateEditedLabel();
+  const rt = $('recTxt');
+  if (rt && !recording) rt.textContent = recTextNow();
+}
+function recTextNow() { return tr('recLabel') + ' 0.0 / ' + fmt(state.dur, 1) + 's'; }
+function applyLang(lang, persist) {
+  LANG = I18N[lang] ? lang : 'zh';
+  document.documentElement.lang = LANG === 'en' ? 'en' : 'zh-CN';
+  document.title = tr('docTitle');
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = tr(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = tr(el.dataset.i18nTitle); });
+  document.querySelectorAll('[data-i18n-aria]').forEach(el => { el.setAttribute('aria-label', tr(el.dataset.i18nAria)); });
+  const sel = $('lang');
+  if (sel && sel.value !== LANG) sel.value = LANG;
+  const seg = $('segLang');
+  if (seg) Array.from(seg.children).forEach(b => {
+    const on = b.dataset.val === LANG;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  refreshI18NText();
+  if (persist !== false) { try { localStorage.setItem('gf.lang', LANG); } catch (e) {} }
+}
+
+/* 窗口尺寸 */
+addEventListener('resize', () => { resize(); drawSwatches(); closePicker(); });
+addEventListener('pagehide', flushSave);       // 关页面 / 刷新前立刻落盘，别丢最后一次改动
+addEventListener('beforeunload', flushSave);
+
+/* ============================================================ 10. 导出 */
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('on');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove('on'), 1900);
+}
+
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+
+/* 强制按目标尺寸渲染一帧并读回像素。
+   必须在同一个同步任务里 render → toDataURL（preserveDrawingBuffer 只保证缓冲区不被清空，
+   但一旦 await 之后合成器可能已经把它换掉了）。 */
+function renderToSize(w, h, timeVal) {
+  const oldW = canvas.width, oldH = canvas.height, oldT = tSim;
+  canvas.width = w; canvas.height = h; vw = w; vh = h;
+  gl.viewport(0, 0, w, h);
+  if (timeVal !== undefined) tSim = timeVal;
+  renderFrame();
+  const url = canvas.toDataURL('image/png');
+  canvas.width = oldW; canvas.height = oldH; vw = oldW; vh = oldH;
+  gl.viewport(0, 0, oldW, oldH);
+  if (timeVal !== undefined) tSim = oldT;
+  renderDirty = true;
+  panelASkip = true;   // 恢复尺寸会清空画布，别拿空白去算面板浓度
+  return url;
+}
+function dataUrlToBlob(url) {
+  const bin = atob(url.split(',')[1]);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Blob([u8], { type: 'image/png' });
+}
+
+function exportStill() {
+  const url = renderToSize(state.outW, state.outH);
+  download(dataUrlToBlob(url), `gradient-${state.outW}x${state.outH}-${Date.now()}.png`);
+  toast(tr('tStillExported')(state.outW, state.outH));
+}
+
+
+/* --- 导出：内容（序列 / 单帧）。
+       序列固定为 PNG（2026-09 按用户要求把 WebP 序列下线：PNG 是后期软件通用的无损序列格式）。
+       与 particle-pointcloud 的"渲染导出"同一套结构：面板上选好参数，一个按钮直接出。 --- */
+let recording = false;
+let exporting = false;   // 导出序列时让主 rAF 停手，避免和导出抢画布
+
+function doExport() {
+  if (state.expMode === 'still') { exportStill(); return; }
+  recordPngSeq();
+}
+$('btnExport').addEventListener('click', doExport);
+
+/* 内容：序列 / 单帧 —— 单帧时隐藏时长与帧率 */
+$('expMode').addEventListener('click', e => {
+  const b = e.target.closest('button[data-exp]'); if (!b) return;
+  state.expMode = b.dataset.exp;
+  [...$('expMode').children].forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.animOnly').forEach(el => { el.style.display = state.expMode === 'still' ? 'none' : ''; });
+  $('btnExport').textContent = state.expMode === 'still' ? tr('btnExportStill') : tr('btnExportSeq');
+  saveSoon();
+});
+/* 序列帧率 */
+state.expFps = 30;
+$('fpsSeg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-fps]'); if (!b) return;
+  state.expFps = parseInt(b.dataset.fps, 10);
+  [...$('fpsSeg').children].forEach(x => x.classList.toggle('on', x === b));
+  saveSoon();
+});
+
+
+/* --- PNG 序列：离线逐帧渲染（不依赖实时帧率），自己写一个最小 ZIP（store，不压缩） --- */
+function crc32(buf) {
+  let c, table = crc32._t;
+  if (!table) {
+    table = crc32._t = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+  }
+  let crc = -1;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ table[(crc ^ buf[i]) & 0xff];
+  return (crc ^ -1) >>> 0;
+}
+function zipStore(files) {   // files: [{name, data:Uint8Array}]
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  const u16 = v => [v & 255, (v >> 8) & 255];
+  const u32 = v => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255];
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+    const lh = new Uint8Array([...u32(0x04034b50), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+      ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length), ...u16(0)]);
+    parts.push(lh, name, f.data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+      ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0),
+      ...u32(offset)]), name);
+    offset += lh.length + name.length + n;
+  }
+  let cdSize = 0;
+  for (const c of central) cdSize += c.length;
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0),
+    ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(offset), ...u16(0)]);
+  return new Blob([...parts, ...central, end], { type: 'application/zip' });
+}
+
+async function recordPngSeq() {
+  if (recording) return;
+  const FPS = state.expFps || 30, total = Math.round(state.dur * FPS);
+  const est = total * state.outW * state.outH * 0.35;
+  if (est > 500e6 && !confirm(tr('cfBigExport')(total, state.outW, state.outH))) return;
+
+  recording = true;
+  exporting = true;                     // 主 rAF 停手，导出期间不再和预览抢画布
+  $('recBar').classList.add('on');
+  const t0 = tSim;
+  const files = [];
+  const wasPaused = state.paused;
+  const wasGrain = state.grain;
+  const oldW = canvas.width, oldH = canvas.height;
+  state.paused = true;                 // 离线渲染：时间由我们显式给
+  state.grain = 0;                     // 序列要的是干净的画面，颗粒在合成里加更可控
+
+  try {
+    /* 画布只在开头改成导出尺寸一次，后续逐帧不再 resize；
+       PNG 用 toBlob（避免 toDataURL 的 base64 + fetch 副本）。 */
+    canvas.width = state.outW; canvas.height = state.outH;
+    vw = state.outW; vh = state.outH;
+    gl.viewport(0, 0, vw, vh);
+    for (let i = 0; i < total; i++) {
+      tSim = t0 + i / FPS * state.speed;
+      renderFrame();
+      const blob = await new Promise((res, rej) => {
+        canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob failed')), 'image/png');
+      });
+      files.push({ name: `frame_${String(i).padStart(4, '0')}.png`, data: new Uint8Array(await blob.arrayBuffer()) });
+      $('recTxt').textContent = tr('recProgress')(i + 1, total);
+      if (i % 2 === 0) await new Promise(r => setTimeout(r, 0));   // 让出主线程，UI 不假死
+    }
+    download(zipStore(files), `gradient-seq-${state.outW}x${state.outH}-${total}f.zip`);
+  } finally {
+    canvas.width = oldW; canvas.height = oldH;
+    vw = oldW; vh = oldH;
+    gl.viewport(0, 0, oldW, oldH);
+    tSim = t0;
+    state.paused = wasPaused;
+    state.grain = wasGrain;
+    exporting = false;
+    recording = false;
+    $('recBar').classList.remove('on');
+    last = 0;
+    renderDirty = true;
+    panelASkip = true;
+  }
+  toast(tr('tSeqExported')(total, FPS));
+}
+
+/* --- 网页背景代码：把当前参数冻结成一份独立可跑的 HTML --- */
+function buildEmbedHTML() {
+  const cfg = {
+    seed: state.seed, speed: state.speed, size: state.size, rnd: state.rnd,
+    count: state.count, map: state.map, soft: state.soft, gap: state.gap, grain: state.grain,
+    vin: state.vin, field: state.field, warp: state.warp,
+    frost: state.frost, warpEps: state.warpEps,
+    /* 玻璃：导出物里**冻结生效值**（不带走预设表）——这样导出物的着色器
+       不需要知道"哪种类型该配多少尺寸/高光"，也就不用跟 app.js 同步那张表。
+       eff* 是派生量：开关关掉时全为 0。 */
+    glassType: state.glassType, glassSize: state.glassSize, glassHi: state.glassHi,
+    glassOn: state.glassOn ? 1 : 0, glassAmt: glassAmtNow(), glassHaze: glassHazeNow(),
+    gradMode: state.gradMode, gradN: gradStops.n, grad: Array.from(gradStops.arr.slice(0, gradStops.n * 3)),
+    colMix: state.colMix, harmonize: state.harmonize,
+    blobsA: Array.from(blobA), blobsB: Array.from(blobB),
+  };
+  const lutArr = [];
+  for (let i = 0; i < LUT_N; i++) lutArr.push(
+    Math.round(lut[i * 4] * 255) + ',' + Math.round(lut[i * 4 + 1] * 255) + ',' + Math.round(lut[i * 4 + 2] * 255));
+  const stopList = [];
+  for (let i = 0; i < 8; i++) {
+    const j = Math.round(i / 7 * (LUT_N - 1));
+    stopList.push(rgb2hex(lutSrgb[j * 3], lutSrgb[j * 3 + 1], lutSrgb[j * 3 + 2]));
+  }
+  const cssKf = true ? `
+/* ---- 纯 CSS 降级版（不需要 WebGL，但只有 4 个色团、无域扭曲）---- */
+.gf-bg-css {
+  background:
+    radial-gradient(46% 58% at 22% 26%, ${stopList[1]}cc 0%, transparent 62%),
+    radial-gradient(52% 62% at 78% 34%, ${stopList[4]}cc 0%, transparent 64%),
+    radial-gradient(58% 52% at 64% 80%, ${stopList[6]}cc 0%, transparent 66%),
+    radial-gradient(64% 60% at 26% 78%, ${stopList[2]}bb 0%, transparent 68%),
+    linear-gradient(160deg, ${stopList[0]}, ${stopList[7]});
+  filter: blur(42px) saturate(1.05);
+  animation: gf-drift 26s ease-in-out infinite alternate;
+  transform: scale(1.25);
+}
+@keyframes gf-drift {
+  0%   { transform: scale(1.25) translate3d(-2%, -1%, 0) rotate(0deg); }
+  50%  { transform: scale(1.32) translate3d(2%, 1.5%, 0) rotate(3deg); }
+  100% { transform: scale(1.25) translate3d(1%, -2%, 0) rotate(-2deg); }
+}
+@media (prefers-reduced-motion: reduce) { .gf-bg-css { animation: none; } }` : '';
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>渐变流动背景</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000}
+  /* WebGL 画布：固定在底层、铺满、不接收鼠标事件 */
+  #gf{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:-1}
+  /* 内容示例：删掉换成你自己的页面即可 */
+  .gf-content{position:relative;z-index:1;height:100%;display:flex;align-items:center;justify-content:center;
+    color:#fff;font:600 clamp(28px,6vw,72px)/1.1 -apple-system,"PingFang SC",sans-serif;
+    letter-spacing:.02em;text-shadow:0 2px 30px rgba(0,0,0,.25)}
+${cssKf}
+</style></head>
+<body>
+<canvas id="gf"></canvas>
+<div class="gf-content">把这段文字换成你的内容</div>
+<script>
+/* 由「渐变流动」导出 · 参数已冻结在 CFG 里。想改动态请回到工具里调好再导出。 */
+const CFG = ${JSON.stringify(cfg)};
+const LUT_RGB = [${lutArr.join(',')}];
+(function(){
+  const cv = document.getElementById('gf');
+  const gl = cv.getContext('webgl2', {alpha:false, antialias:false, depth:false, preserveDrawingBuffer:false});
+  if (!gl) { cv.style.display='none'; document.body.classList.add('gf-fallback'); return; }
+  const VS = \`#version 300 es
+precision highp float;
+const vec2 P[3] = vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+void main(){ gl_Position = vec4(P[gl_VertexID],0.,1.); }\`;
+  /* 三段着色器与工具里完全一致：场趟 → 可分离高斯 → 合成。
+     毛玻璃是导出物的默认观感，所以这里也走多趟；显存不够时自动退回单趟。 */
+  const FS_FIELD = \`${FS_FIELD.replace(/`/g, '\\`').replace(/\$\{/g, '\\${')}\`;
+  const FS_BLUR  = \`${FS_BLUR.replace(/`/g, '\\`').replace(/\$\{/g, '\\${')}\`;
+  const FS_COMP  = \`${FS_COMPOSITE.replace(/`/g, '\\`').replace(/\$\{/g, '\\${')}\`;
+  function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o;}
+  function mk(fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);return p;}
+  const NAMES=['uRes','uTime','uPix','uGrainT','uBlobs','uBlobB','uCount','uMap','uSoft','uSizeK','uGap','uRnd','uGrain','uVignette','uLUT','uDebug','uAspect','uFieldGain','uWarp','uWarpEps','uFieldRes','uFrost','uGradMode','uGradN','uGrad','uMix','uGlass','uGlassAmt','uGlassSize','uGlassHi','uBlurW','uBlurN','uBlurWSum'];
+  function uni(p){const u={};NAMES.forEach(n=>u[n]=gl.getUniformLocation(p,n));return u;}
+  const pF=mk(FS_FIELD), pB=mk(FS_BLUR), pC=mk(FS_COMP);
+  const UF=uni(pF), UB=uni(pB), UC=uni(pC);
+  UB.uFieldTex=gl.getUniformLocation(pB,'uFieldTex'); UB.uDir=gl.getUniformLocation(pB,'uDir'); UB.uRadius=gl.getUniformLocation(pB,'uRadius');
+  UC.uFieldTex=gl.getUniformLocation(pC,'uFieldTex'); UC.uFrost=gl.getUniformLocation(pC,'uFrost');
+
+  const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const px=new Uint8Array(${LUT_N}*4);
+  for(let i=0;i<${LUT_N};i++){px[i*4]=LUT_RGB[i*3];px[i*4+1]=LUT_RGB[i*3+1];px[i*4+2]=LUT_RGB[i*3+2];px[i*4+3]=255;}
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,${LUT_N},1,0,gl.RGBA,gl.UNSIGNED_BYTE,px);
+
+  const blobsA=new Float32Array(CFG.blobsA), blobsB=new Float32Array(CFG.blobsB);
+  /* 模糊权重在 CPU 预计算（与主程序同一套）。色块位置仍由 GLSL blobPos 算。 */
+  const bw=new Float32Array(96);
+  function setBlurWeights(r){
+    const sigma=Math.max(r/3,.5),inv=1/(2*sigma*sigma),maxX=r*4/3+1;
+    let n=0,ws=1;
+    for(let i=1;i<=96;i++){
+      const x=(i-.5)*2;if(x>maxX)break;
+      const w=Math.exp(-x*x*inv);bw[i-1]=w;ws+=2*w;n++;
+    }
+    gl.uniform1fv(UB.uBlurW,bw);gl.uniform1i(UB.uBlurN,n);gl.uniform1f(UB.uBlurWSum,ws);
+  }
+  const hasFloat=!!(gl.getExtension('EXT_color_buffer_float')||gl.getExtension('EXT_color_buffer_half_float'));
+  const rt={fbo:[gl.createFramebuffer(),gl.createFramebuffer()],tex:[gl.createTexture(),gl.createTexture()],w:0,h:0};
+  function allocRT(){
+    for(let i=0;i<2;i++){
+      gl.bindTexture(gl.TEXTURE_2D,rt.tex[i]);
+      if(hasFloat) gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,rt.w,rt.h,0,gl.RGBA,gl.HALF_FLOAT,null);
+      else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,rt.w,rt.h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,rt.fbo[i]);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,rt.tex[i],0);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  }
+  let W=2,H=2,t=0,last=0,gs=0,dpr=1;
+  function resize(){
+    dpr=Math.min(devicePixelRatio||1,2);
+    const w=Math.max(2,Math.round(innerWidth*dpr)),h=Math.max(2,Math.round(innerHeight*dpr));
+    if(w!==cv.width||h!==cv.height){cv.width=w;cv.height=h;rt.w=w;rt.h=h;if(hasFloat)allocRT();}
+    W=cv.width;H=cv.height;
+  }
+  function common(u){
+    gl.uniform2f(u.uRes,W,H);gl.uniform1f(u.uTime,t);gl.uniform1f(u.uPix,dpr);
+    if(u.uFieldRes)gl.uniform2f(u.uFieldRes,rt.w||W,rt.h||H);   // 漏了它会 texel=1/0=Inf，画面塌成一片
+    /* 每个 uniform 独立判断，别套在外层条件里 ——
+       曾把它们塞进 if(u.uGradMode) 块，gradMode 为 0 时整块不执行，
+       uMix 保持 0，导出的背景直接全黑。 */
+    if(u.uGradMode)gl.uniform1i(u.uGradMode,CFG.gradMode|0);
+    if(u.uGradN)gl.uniform1i(u.uGradN,CFG.gradN||12);
+    if(u.uGrad)gl.uniform3fv(u.uGrad,new Float32Array(CFG.grad||[]));
+    if(u.uMix)gl.uniform1f(u.uMix,CFG.colMix===undefined?0.25:CFG.colMix);
+    /* 玻璃（uGlass 只在合成趟里存在）。类型/尺度/高光缺省时退回"毛玻璃 + 强度"，
+       所以 2026-09 之前导出的 HTML 用新版脚本打开仍然是对的。
+        2026-09 二次改版后导出物还带 glassOn / glassAmt / glassHaze（生效值），
+        开关关掉时 amt 与 hi 都乘 0 —— 导出物里没有预设表，也不需要跟 app.js 同步。 */
+    if(u.uGlass){
+      var gOn=(CFG.glassOn===undefined?1:CFG.glassOn)?1:0;
+      gl.uniform1i(u.uGlass,CFG.glassType|0);
+      gl.uniform1f(u.uGlassAmt,gOn*(CFG.glassAmt!==undefined?CFG.glassAmt:(CFG.frost===undefined?0.6:CFG.frost)));
+      gl.uniform1f(u.uGlassSize,CFG.glassSize||1);
+      gl.uniform1f(u.uGlassHi,gOn*(CFG.glassHi||0));
+    }
+    gl.uniform1f(u.uGrainT,Math.floor(t*24));
+    gl.uniform4fv(u.uBlobs,blobsA);gl.uniform4fv(u.uBlobB,blobsB);gl.uniform1i(u.uCount,CFG.count);
+    gl.uniform1f(u.uMap,CFG.map);gl.uniform1f(u.uSoft,CFG.soft);gl.uniform1f(u.uSizeK,(CFG.size||1)*(CFG.size||1));gl.uniform1f(u.uGap,CFG.gap);
+    gl.uniform1f(u.uRnd,CFG.rnd===undefined?1:CFG.rnd);
+    gl.uniform1f(u.uAspect,W/Math.max(1,H));
+    gl.uniform1f(u.uFieldGain,CFG.field);gl.uniform1f(u.uWarp,CFG.warp);gl.uniform1f(u.uWarpEps,CFG.warpEps);
+    gl.uniform1f(u.uGrain,CFG.grain);
+    gl.uniform1f(u.uVignette,CFG.vin);gl.uniform1i(u.uDebug,0);
+  }
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;   // 尊重系统设置
+  function draw(){
+    resize();
+    const now=performance.now(), dt=last?Math.min(.05,(now-last)/1000):0; last=now;
+    if(!reduce) t += dt*CFG.speed;
+    /* 雾量用导出时算好的生效值；旧导出物没有它 → 退回 frost × 旧类型系数 */
+    const gHaze=(CFG.glassOn!==undefined&&!CFG.glassOn)?0:(CFG.glassHaze!==undefined?CFG.glassHaze:CFG.frost*([1,0.15,0.45,0.2,0.15][CFG.glassType|0]||1));
+    const radius=gHaze*0.18*Math.min(W,H);
+    const doBlur=hasFloat&&radius>=0.6;
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);
+    if(hasFloat){
+      gl.bindFramebuffer(gl.FRAMEBUFFER,rt.fbo[0]);gl.viewport(0,0,W,H);
+      gl.useProgram(pF);common(UF);gl.uniform1i(UF.uLUT,0);gl.drawArrays(gl.TRIANGLES,0,3);
+      if(doBlur){
+        gl.useProgram(pB);common(UB);
+        gl.uniform1i(UB.uFieldTex,0);gl.uniform1f(UB.uRadius,radius);setBlurWeights(radius);
+        gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,rt.tex[0]);
+        gl.bindFramebuffer(gl.FRAMEBUFFER,rt.fbo[1]);gl.uniform2f(UB.uDir,1,0);gl.drawArrays(gl.TRIANGLES,0,3);
+        gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,rt.tex[1]);
+        gl.bindFramebuffer(gl.FRAMEBUFFER,rt.fbo[0]);gl.uniform2f(UB.uDir,0,1);gl.drawArrays(gl.TRIANGLES,0,3);
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);
+      gl.useProgram(pC);common(UC);
+      gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);gl.uniform1i(UC.uLUT,0);
+      gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,rt.tex[0]);gl.uniform1i(UC.uFieldTex,1);
+      gl.uniform1f(UC.uFrost,doBlur?1:0);
+      gl.drawArrays(gl.TRIANGLES,0,3);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);
+      gl.useProgram(pC);common(UC);gl.uniform1i(UC.uLUT,0);gl.uniform1i(UC.uFieldTex,0);gl.uniform1f(UC.uFrost,0);
+      gl.drawArrays(gl.TRIANGLES,0,3);
+    }
+    requestAnimationFrame(draw);
+    /* draw() 暴露给宿主页面：需要"同步渲染一帧再读像素"时用（截图/自动化验收）。
+       画布没开 preserveDrawingBuffer，异步读到的永远是已清空的缓冲区。 */
+    window.__gfDraw = draw;
+  }
+  draw();
+  document.addEventListener('visibilitychange',()=>{ last=0; });   // 切回标签页不跳帧
+})();
+<\/script>
+</body></html>`;
+}
+
+$('factory').addEventListener('click', () => {
+  if (!confirm(tr('cfFactory'))) return;
+  GF.resetAll();
+  toast(tr('tFactoryDone'));
+});
+
+$('embed').addEventListener('click', () => {
+  const html = buildEmbedHTML();
+  openModal(tr('mEmbed'), `
+    <div class="hint" style="margin:0 0 12px">${tr('mEmbedNote1')}</div>
+    <textarea readonly id="embedCode" spellcheck="false"></textarea>
+    <div class="btn-row">
+      <button class="btn primary" id="dlEmbed">${tr('dlEmbed')}</button>
+      <button class="btn" id="copyEmbed">${tr('copyEmbed')}</button>
+    </div>
+    <div class="hint">${tr('mEmbedNote2')}</div>
+  `, html);
+  const code = $('embedCode');
+  code.style.height = '320px';
+  $('dlEmbed').addEventListener('click', () => {
+    download(new Blob([html], { type: 'text/html' }), 'background.html');
+    toast(tr('tDownloaded'));
+  });
+  $('copyEmbed').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(html); toast(tr('tCopied')); }
+    catch (e) { code.select(); document.execCommand('copy'); toast(tr('tCopied')); }
+  });
+});
+
+/* ============================================================ 11. 弹层 */
+function openModal(title, bodyHtml, textareaValue) {
+  $('mTitle').textContent = title;
+  $('mBody').innerHTML = bodyHtml;
+  if (textareaValue !== undefined) {
+    const ta = document.createElement('textarea');
+    ta.readOnly = true; ta.spellcheck = false; ta.value = textareaValue;
+    const holder = $('embedCode');
+    if (holder) holder.replaceWith(ta), ta.id = 'embedCode';
+    else $('mBody').prepend(ta);
+  }
+  $('modal').classList.add('on');
+}
+function closeModal() { $('modal').classList.remove('on'); $('mBody').innerHTML = ''; }
+$('mClose').addEventListener('click', closeModal);
+$('modal').addEventListener('click', e => { if (e.target === $('modal')) closeModal(); });
+
+/* ============================================================ 12. 持久化 */
+let saveT = 0;
+/* 状态结构的版本号。改动 state 的键、或某个键的含义时**必须**加一：
+   旧存档与新代码不兼容时会被直接丢弃，而不是把一个半残的状态灌进新代码
+   （症状通常是"打开是黑的/界面错乱"）。 */
+const STATE_VERSION = 3;
+
+function doSave() {
+  try {
+    localStorage.setItem('gradient-flow', JSON.stringify({
+      v: STATE_VERSION,
+      state: { ...state, paused: false },   // 暂停状态不该被记住
+      swatchOff: Array.from(swatchOff), raw: Array.from(rawCurve).map(v => Math.round(v * 1000) / 1000),
+    }));
+  } catch (e) { /* 隐私模式 / 配额满：不影响使用 */ }
+}
+function saveSoon() {
+  clearTimeout(saveT);
+  saveT = setTimeout(doSave, 400);
+}
+function flushSave() { clearTimeout(saveT); doSave(); }
+function restore() {
+  try {
+    const s = JSON.parse(localStorage.getItem('gradient-flow') || 'null');
+    if (!s || !s.state) return false;
+    if (s.v !== STATE_VERSION) return false;      // 结构变了 → 丢弃旧存档，用出厂默认
+    Object.assign(state, s.state);
+    if (s.swatchOff) swatchOff.set(s.swatchOff);
+    if (s.raw && s.raw.length === rawCurve.length) rawCurve.set(s.raw);
+    return true;
+  } catch (e) { return false; }
+}
+
+/* ============================================================ 13. 启动 */
+/* 把所有控件拉到当前 state —— boot() 与 GF.set() 共用，避免"程序化改值后滑杆没复位" */
+function syncUI() {
+  renderDirty = true;
+  ctl.speed.sync(); ctl.size.sync(); ctl.rnd.sync(); ctl.grain.sync(); ctl.vin.sync();
+  ctl.soft.sync(); ctl.warp.sync(); ctl.frost.sync(); ctl.gap.sync(); ctl.bri.sync(); ctl.con.sync(); ctl.sat.sync();
+  ctl.hueS.sync(); ctl.dur.sync();
+  $('count').value = state.count;
+  $('count').style.setProperty('--p', (state.count - 2) / 8 * 100 + '%');
+  [...$('qSeg').children].forEach(x => x.classList.toggle('on', parseFloat(x.dataset.q) === state.quality));
+  $('vQual').textContent = (state.quality < 0.8 ? tr('qSmooth') : state.quality > 1.2 ? tr('qHigh') : tr('qStd'))
+    + ' · ' + (state.quality * Math.pow(0.72, adapt.down)).toFixed(2) + '×';
+  [...$('sizeSeg').children].forEach(x => x.classList.toggle('on', x.dataset.sz === `${state.outW}x${state.outH}`));
+  [...$('expMode').children].forEach(x => x.classList.toggle('on', x.dataset.exp === state.expMode));
+  [...$('fpsSeg').children].forEach(x => x.classList.toggle('on', +x.dataset.fps === state.expFps));
+  document.querySelectorAll('.animOnly').forEach(el => { el.style.display = state.expMode === 'still' ? 'none' : ''; });
+  $('btnExport').textContent = state.expMode === 'still' ? tr('btnExportStill') : tr('btnExportSeq');
+  $('vOutSize').textContent = `${state.outW}×${state.outH}`;
+  /* 玻璃（独立成 07 区之后）：
+     · 总开关的视觉态 + aria-checked
+     · 关掉时把类型/强度/尺寸/高光/预设说明整块收起来（开关打开才出现"玻璃效果"）
+     · 毛玻璃只留「强度」一行 —— 它没有图案，尺寸/高光对它无意义
+     · 四种纹理玻璃：尺寸/高光**有滑块**，默认值随类型（切类型时套该类型的默认，
+       之后可自由调节），另有一句读数和说明告诉用户"这种玻璃的默认是什么" */
+  const gk = glassK();
+  syncGlassPreset();
+  $('glassSw').classList.toggle('on', !!state.glassOn);
+  $('glassSw').setAttribute('aria-checked', state.glassOn ? 'true' : 'false');
+  document.querySelectorAll('.glassOnly, .glassFrostOnly, .glassNonFrost').forEach(el => {
+    const need = !!state.glassOn
+      && (!el.classList.contains('glassFrostOnly') || state.glassType === 0)
+      && (!el.classList.contains('glassNonFrost') || state.glassType !== 0);
+    el.style.display = need ? '' : 'none';
+  });
+  [...$('glassSeg').children].forEach(x => x.classList.toggle('on', +x.dataset.glass === state.glassType));
+  $('vGlass').textContent = glassName(state.glassType);
+  /* 2026-09 夜间任务：用户要求去掉每个 UI 模块后面的解释说明文字，
+     原来这里那句"<类型>的默认：折射 … · 尺寸 … · 高光 …"就是其中的一条，随
+     #glassPreset 元素一并删除。这里保留可选链接写法，元素不在就跳过 ——
+     免得以后谁把元素加回来时 syncUI 直接抛错。 */
+  const gp = $('glassPreset');
+  if (gp) gp.textContent = glassName(state.glassType) + ' · ' + (gk.amt ?? 1).toFixed(2)
+    + ' / ' + gk.size.toFixed(2) + ' / ' + gk.hi.toFixed(2);
+  ctl.glassSize.sync(); ctl.glassHi.sync();
+  $('dur').value = state.dur; $('vDur').textContent = fmt(state.dur, 1) + 's';
+  refreshResets();
+}
+function boot() {
+  const had = restore();
+  if (!had) { setRawFromStops(PRESETS[0].stops); state.preset = 'gray'; }
+
+  buildSwatches();
+  buildBlobs();
+
+  syncUI();
+  setPresetActive(state.preset || 'gray');
+  if (!had) { state.paused = false; }
+
+  /* 语言：初始套用（不落盘 —— 只是把上次记住 / 默认的偏好刷到界面上）。
+     放在 buildSwatches 之后、rebuildLUT 之前：applyLang 会调 syncUI()，
+     而 syncUI 要摸到 ctl.* 与所有 DOM 节点，此时都已就绪。 */
+  bindSeg('segLang', 'lang');
+  $('lang').addEventListener('change', e => applyLang(e.target.value));
+  applyLang(LANG, false);
+  /* 面板玻璃浓度：先把保守值（最实）写上去，首帧取样后再按底亮度放开 */
+  applyPanelA();
+  setPaused(state.paused);
+  const rt = $('recTxt'); if (rt) rt.textContent = recTextNow();
+
+  rebuildLUT();
+  resize();
+  rafId = requestAnimationFrame(frame);
+
+  // 首帧渲染完成后再把画质按需降级一次（低端机自适应）
+  setTimeout(() => {
+    if (frames < 5 && state.quality > 0.6) { canvas.width = 0; resize(); }
+  }, 1200);
+}
+
+auditDuplicates();
+auditUniforms();
+boot();
+
+/* ============================================================ 14. 自动化接口 */
+/* 给验收脚本用（rs 项目那套 CDP 流程）。暴露确定性入口，方便断言。 */
+window.GF = {
+  state, PRESETS,
+  /* 中英切换的确定性入口（验收脚本用）：setLang('en') ≡ 点界面上那个 EN 按钮，
+     走同一条 applyLang 路径，不另开分叉。persist 默认 true（与界面一致）。 */
+  setLang(lang, persist) { applyLang(lang, persist); return LANG; },
+  getLang: () => LANG,
+  glassTable: () => GLASS.map((g, i) => ({ i, name: g.name, nameI18N: glassName(i), amt: g.amt, haze: g.haze, size: g.size, hi: g.hi })),
+  /* 面板玻璃浓度（2026-10-03 第 2 轮）：给验收与"受控前后对照图"用。
+     force(a) 把浓度钉死、停掉自适应（对照出图要求"同一时刻、只改 UI 材质这一个变量"）；
+     force(null) 交还给自适应。 */
+  panelGlass: () => ({ a: +panelA.toFixed(3), target: +panelATarget.toFixed(3),
+                       bg: panelABg === null ? null : +panelABg.toFixed(1),
+                       min: PANEL_A_MIN, max: PANEL_A_MAX, forced: panelAForce }),
+  /* 立刻按当前底图重算一次浓度（不依赖渲染循环 —— 页面被判为后台时 rAF 不走，
+     验收/出图仍然要能拿到确定的结果）。返回实测底亮度。 */
+  panelGlassSample: () => { const bg = samplePanelBackdrop();
+    if (bg !== null) { panelABg = bg; panelATarget = panelAForBg(bg); } return panelABg; },
+  panelGlassForce: a => {
+    panelAForce = (a === null || a === undefined) ? null : Math.max(0, Math.min(1, +a));
+    if (panelAForce !== null) { panelA = panelAForce; applyPanelA(); }   // 立刻生效，不等下一帧
+    return panelAForce;
+  },
+  /* 逃生口：直接写 state（验收用）。
+     必须带上副作用——只改 state 不改几何体/色带，测出来的是"没生效"的假象。 */
+  write(key, val) {
+    state[key] = val;
+    if (key === 'count') buildBlobs();
+    else if (key === 'size') updateBlobRadii();
+    else if (['bri', 'con', 'sat', 'hueShift'].includes(key)) rebuildLUT();
+    syncUI();
+    return state[key];
+  },
+  set(o) {
+    Object.assign(state, o);
+    if (o.count !== undefined) buildBlobs();
+    if (['size'].some(k => k in o)) updateBlobRadii();
+    syncUI();
+    rebuildLUT();
+    return { count: state.count, size: state.size, grain: state.grain };
+  },
+  syncUI: () => syncUI(),
+  preset: id => applyPreset(id),
+  line: () => ({ ...line }),
+  gradMode: m => { state.gradMode = m; return m; },
+  lutExactAt: i => rgb2hex(lutSrgbExact[i*3], lutSrgbExact[i*3+1], lutSrgbExact[i*3+2]),
+  exactNow: n => rgb2hex(...swatchExactRGB(n)),
+  rawInput: (n, hex) => { applySwatch(n, swatchExactRGB(n), hex); return rgb2hex(...swatchExactRGB(n)); },
+  debugSwatches: () => Array.from({ length: SWATCH_N }, (_, n) => ({
+    n, off: [swatchOff[n * 3], swatchOff[n * 3 + 1], swatchOff[n * 3 + 2]].map(v => +v.toFixed(4)),
+    exact: rgb2hex(...swatchExactRGB(n)), ui: rgb2hex(...lutSrgbIndex(n)),
+    raw: rgb2hex(rawCurve[n * 3], rawCurve[n * 3 + 1], rawCurve[n * 3 + 2]),
+  })),
+  pixel(x, y) {                     // 读画布某一像素（0..1 归一化），必须在 render 之后同步调用
+    const px = new Uint8Array(4);
+    gl.readPixels(Math.round(x * (vw - 1)), Math.round((1 - y) * (vh - 1)), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return [px[0], px[1], px[2]];
+  },
+  stats() {                         // 整幅画面的统计（判断"是不是一片死黑/死白、有没有动态范围"）
+    const w = vw, h = vh;
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    let mn = 255, mx = 0, sum = 0, sat = 0, cnt = 0;
+    const hist = new Int32Array(16);
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+      const i = (y * w + x) * 4, r = buf[i], g = buf[i + 1], b = buf[i + 2];
+      const l = (r * 0.2126 + g * 0.7152 + b * 0.0722);
+      if (l < mn) mn = l; if (l > mx) mx = l; sum += l; cnt++;
+      const mxc = Math.max(r, g, b), mnc = Math.min(r, g, b);
+      sat += mxc === 0 ? 0 : (mxc - mnc) / mxc;
+      hist[Math.min(15, l / 16 | 0)]++;
+    }
+    return { min: +mn.toFixed(1), max: +mx.toFixed(1), mean: +(sum / cnt).toFixed(1),
+             sat: +(sat / cnt).toFixed(3), hist: Array.from(hist) };
+  },
+  lut: () => Array.from({ length: LUT_N }, (_, i) => rgb2hex(lutSrgb[i * 3], lutSrgb[i * 3 + 1], lutSrgb[i * 3 + 2])),
+  /* 两个不同的东西，别混：
+       raw()   = 取样线原始采样（图片取色的直接结果，不含取色点偏移与调色）
+       curve() = 最终显示色带（取色点偏移 + 调色之后，也就是画面真正用的颜色） */
+  raw: () => Array.from({ length: LUT_N }, (_, i) => rgb2hex(rawCurve[i * 3], rawCurve[i * 3 + 1], rawCurve[i * 3 + 2])),
+  curve: () => Array.from({ length: LUT_N }, (_, i) => rgb2hex(lutSrgbExact[i * 3], lutSrgbExact[i * 3 + 1], lutSrgbExact[i * 3 + 2])),
+  swatch: n => rgb2hex(...lutSrgbIndex(n)),
+  /* 精确读回：在色带坐标上做双线性插值（UI 上的 swatch() 只有 8bit 精度，
+     验收里直接拿它比对十六进制会有 ±1 的量化误差）。 */
+  swatchExact: n => rgb2hex(...swatchExactRGB(n)),
+  /* 程序化改色：同样冻结基准 → 反复写同一目标色是幂等的 */
+  /* 程序化改色：基准色用"当前色"，并且只算一次差值 —— 反复写同一目标色会收敛到稳定值 */
+  editSwatch: (n, hex) => { applySwatch(n, swatchExactRGB(n), hex); return rgb2hex(...swatchExactRGB(n)); },
+  baseOf: n => rgb2hex(...swatchExactRGB(n)),
+  openPicker: n => openPicker(n, swBtns[n]),
+  pickerDrag: (s, v) => { pickS = s; pickV = v; drawSV(); syncPickerUI(); return rgb2hex(...lutSrgbIndex(pickN)); },
+  pickerHex: hex => { pickHex.value = hex; pickHex.dispatchEvent(new Event('change')); return pickN < 0 ? null : rgb2hex(...lutSrgbIndex(pickN)); },
+  closePicker,
+  setPreset: id => applyPreset(id),
+  closeAllSwatches: () => { swatchOff.fill(0); rebuildLUT(); },
+  blobSample: i => Array.from(blobA.slice(i * 4, i * 4 + 4)).concat(Array.from(blobB.slice(i * 4, i * 4 + 4))),
+  reseed: seed => { state.seed = seed; buildBlobs(); return state.seed; },
+  time: () => tSim,
+  exportHTML: () => buildEmbedHTML(),
+  renderAt: (w, h, t) => renderToSize(w, h, t),
+  frames: () => frames,
+  onFrame: cb => { frameCbs.push(cb); return frameCbs.length; },
+  errors: () => window.__gfErrors || [],
+  setQuality: q => { state.quality = q; canvas.width = 0; resize(); return state.quality; },
+  /* 验收/性能测量用：把画布尺寸设成指定值（走内部 resize，离屏纹理状态才是对的）。
+     直接改 canvas.width 而不走 resize，离屏纹理尺寸会和画布不一致，测出来的数字没意义。 */
+  setSize: (w, h) => {
+    const dpr = Math.min(devicePixelRatio || 1, 2) * state.quality;
+    canvas.width = Math.max(2, Math.round(w * dpr));
+    canvas.height = Math.max(2, Math.round(h * dpr));
+    vw = canvas.width; vh = canvas.height;
+    gl.viewport(0, 0, vw, vh);
+    ensureRT(vw, vh);
+    renderDirty = true;
+    panelASkip = true;
+    return [vw, vh];
+  },
+  warm: (n = 12) => { for (let i = 0; i < n; i++) renderFrame(); return n; },
+  rtSize: () => [rt.w, rt.h],
+  quality: () => state.quality,
+  size: () => ({ w: vw, h: vh, cssW: innerWidth, cssH: innerHeight, dpr: Math.min(devicePixelRatio || 1, 2) }),
+  preset: id => applyPreset(id),
+  lutExactAt: i => rgb2hex(lutSrgbExact[i*3], lutSrgbExact[i*3+1], lutSrgbExact[i*3+2]),
+  exactNow: n => rgb2hex(...swatchExactRGB(n)),
+  rawInput: (n, hex) => { applySwatch(n, swatchExactRGB(n), hex); return rgb2hex(...swatchExactRGB(n)); },
+  debugSwatches: () => Array.from({ length: SWATCH_N }, (_, n) => ({
+    n, off: [swatchOff[n * 3], swatchOff[n * 3 + 1], swatchOff[n * 3 + 2]].map(v => +v.toFixed(4)),
+    exact: rgb2hex(...swatchExactRGB(n)), ui: rgb2hex(...lutSrgbIndex(n)),
+    raw: rgb2hex(rawCurve[n * 3], rawCurve[n * 3 + 1], rawCurve[n * 3 + 2]),
+  })),
+  pixel(x, y) {                     // 读画布某一像素（0..1 归一化），必须在 render 之后同步调用
+    const px = new Uint8Array(4);
+    gl.readPixels(Math.round(x * (vw - 1)), Math.round((1 - y) * (vh - 1)), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return [px[0], px[1], px[2]];
+  },
+  stats() {                         // 整幅画面的统计（判断"是不是一片死黑/死白、有没有动态范围"）
+    const w = vw, h = vh;
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    let mn = 255, mx = 0, sum = 0, sat = 0, cnt = 0;
+    const hist = new Int32Array(16);
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+      const i = (y * w + x) * 4, r = buf[i], g = buf[i + 1], b = buf[i + 2];
+      const l = (r * 0.2126 + g * 0.7152 + b * 0.0722);
+      if (l < mn) mn = l; if (l > mx) mx = l; sum += l; cnt++;
+      const mxc = Math.max(r, g, b), mnc = Math.min(r, g, b);
+      sat += mxc === 0 ? 0 : (mxc - mnc) / mxc;
+      hist[Math.min(15, l / 16 | 0)]++;
+    }
+    return { min: +mn.toFixed(1), max: +mx.toFixed(1), mean: +(sum / cnt).toFixed(1),
+             sat: +(sat / cnt).toFixed(3), hist: Array.from(hist) };
+  },
+  lut: () => Array.from({ length: LUT_N }, (_, i) => rgb2hex(lutSrgb[i * 3], lutSrgb[i * 3 + 1], lutSrgb[i * 3 + 2])),
+  /* 空间度量（玻璃验收用）：四个方向的相邻像素差平均绝对值。
+     玻璃纹理是**有方向**的 —— 长虹只在水平方向折射、布纹是 45° 菱格、橘皮各向同性，
+     所以"哪个方向的差分大"就是分辨类型的客观判据（不靠人眼、不依赖 PNG 解码）。 */
+  grads(step = 1) {
+    const w = vw, h = vh;
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const L = (x, y) => { const i = (y * w + x) * 4; return buf[i] * 0.2126 + buf[i + 1] * 0.7152 + buf[i + 2] * 0.0722; };
+    let dx = 0, dy = 0, d1 = 0, d2 = 0, n = 0;
+    for (let y = step; y < h - step; y += 2) for (let x = step; x < w - step; x += 2) {
+      dx += Math.abs(L(x + step, y) - L(x - step, y));
+      dy += Math.abs(L(x, y + step) - L(x, y - step));
+      d1 += Math.abs(L(x + step, y + step) - L(x - step, y - step));
+      d2 += Math.abs(L(x + step, y - step) - L(x - step, y + step));
+      n++;
+    }
+    return { dx: +(dx / n).toFixed(3), dy: +(dy / n).toFixed(3),
+             d1: +(d1 / n).toFixed(3), d2: +(d2 / n).toFixed(3) };
+  },
+  /* 一条扫描线的亮度（t = 0..1 的轴向位置，最多 1280 个采样）。
+     axis='h' 取一行（沿 x），axis='v' 取一列（沿 y）。
+     数条纹/看频谱用 —— "分辨率无关"只能这样证明：同样是竖肋，
+     1280×720 与 640×360 出图的肋条**根数**必须一致，而不是像素宽度一致。
+     注意：谱分析前一定要做高通（差分），否则低频渐变会把纹理峰完全盖住 ——
+     实测不差分时四条曲线的主峰全落在 k=4（渐变本身），纹理信息根本看不见。 */
+  scan(t = 0.5, axis = 'h') {
+    const w = vw, h = vh, out0 = [];
+    if (axis === 'v') {
+      const x = Math.min(w - 1, Math.max(0, Math.round(t * (w - 1))));
+      const buf = new Uint8Array(h * 4);
+      gl.readPixels(x, 0, 1, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      const n = Math.min(h, 1280);
+      for (let i = 0; i < n; i++) {
+        const s = Math.round(i * (h - 1) / Math.max(1, n - 1)) * 4;
+        out0.push(+(buf[s] * 0.2126 + buf[s + 1] * 0.7152 + buf[s + 2] * 0.0722).toFixed(1));
+      }
+    } else {
+      const y = Math.min(h - 1, Math.max(0, Math.round(t * (h - 1))));
+      const buf = new Uint8Array(w * 4);
+      gl.readPixels(0, y, w, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      const n = Math.min(w, 1280);
+      for (let i = 0; i < n; i++) {
+        const s = Math.round(i * (w - 1) / Math.max(1, n - 1)) * 4;
+        out0.push(+(buf[s] * 0.2126 + buf[s + 1] * 0.7152 + buf[s + 2] * 0.0722).toFixed(1));
+      }
+    }
+    return out0;
+  },
+  raw: () => Array.from({ length: LUT_N }, (_, i) => rgb2hex(rawCurve[i * 3], rawCurve[i * 3 + 1], rawCurve[i * 3 + 2])),
+  swatch: n => rgb2hex(...lutSrgbIndex(n)),
+  /* 精确读回：在色带坐标上做双线性插值（UI 上的 swatch() 只有 8bit 精度，
+     验收里直接拿它比对十六进制会有 ±1 的量化误差）。 */
+  swatchExact: n => rgb2hex(...swatchExactRGB(n)),
+  /* 程序化改色：同样冻结基准 → 反复写同一目标色是幂等的 */
+  /* 程序化改色：基准色用"当前色"，并且只算一次差值 —— 反复写同一目标色会收敛到稳定值 */
+  editSwatch: (n, hex) => { applySwatch(n, swatchExactRGB(n), hex); return rgb2hex(...swatchExactRGB(n)); },
+  baseOf: n => rgb2hex(...swatchExactRGB(n)),
+  openPicker: n => openPicker(n, swBtns[n]),
+  pickerDrag: (s, v) => { pickS = s; pickV = v; drawSV(); syncPickerUI(); return rgb2hex(...lutSrgbIndex(pickN)); },
+  pickerHex: hex => { pickHex.value = hex; pickHex.dispatchEvent(new Event('change')); return pickN < 0 ? null : rgb2hex(...lutSrgbIndex(pickN)); },
+  closePicker,
+  setPreset: id => applyPreset(id),
+  closeAllSwatches: () => { swatchOff.fill(0); rebuildLUT(); },
+  blobSample: i => Array.from(blobA.slice(i * 4, i * 4 + 4)).concat(Array.from(blobB.slice(i * 4, i * 4 + 4))),
+  reseed: seed => { state.seed = seed; buildBlobs(); return state.seed; },
+  time: () => tSim,
+  exportHTML: () => buildEmbedHTML(),
+  renderAt: (w, h, t) => renderToSize(w, h, t),
+  frames: () => frames,
+  onFrame: cb => { frameCbs.push(cb); return frameCbs.length; },
+  errors: () => window.__gfErrors || [],
+  /* GPU 计时基准：用 EXT_disjoint_timer_query_webgl2 量每一趟的真实耗时（毫秒）。
+     FPS 被 vsync 钉在 60，看不出 GPU 负载 —— 判断优化效果必须看这个。 */
+  gpuBench(iters = 40) {
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    if (!ext) return { error: '不支持计时器扩展' };
+    const run = (label, pass) => {
+      // 预热：第 1 次往往包含惰性编译
+      for (let i = 0; i < 3; i++) pass();
+      const q = gl.createQuery();
+      gl.beginQuery(ext.TIME_ELAPSED_EXT, q);
+      for (let i = 0; i < iters; i++) pass();
+      gl.endQuery(ext.TIME_ELAPSED_EXT, q);
+      gl.flush();
+      const out = { label };
+      const wait = () => {
+        const done = gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE);
+        const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);
+        if (done && !disjoint) {
+          out.ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6 / iters;
+          gl.deleteQuery(q);
+        } else if (disjoint) { out.ms = -1; gl.deleteQuery(q); }
+        else return false;
+        return true;
+      };
+      return { out, wait };
+    };
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const res = [];
+    ensureRT(vw, vh);
+    const jobs = [
+      run('① 场趟', () => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[0]); gl.viewport(0, 0, vw, vh);
+        gl.useProgram(progField); setUniforms(UF, vw, vh);
+        bindTex(0, lutTex); gl.uniform1i(UF.uLUT, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }),
+      run('② 模糊趟（横+纵）', () => {
+        const radius = glassHazeNow() * 0.18 * Math.min(vw, vh);
+        gl.useProgram(progBlur); setUniforms(UB, vw, vh);
+        bindTex(0, rt.tex[0]); gl.uniform1i(UB.uFieldTex, 0); gl.uniform1f(UB.uRadius, radius);
+        uploadBlurWeights(UB, radius);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[1]); gl.uniform2f(UB.uDir, 1, 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
+        bindTex(0, rt.tex[1]); gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo[0]); gl.uniform2f(UB.uDir, 0, 1);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }),
+      run('③ 合成趟', () => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, vw, vh);
+        gl.useProgram(progComposite); setUniforms(UC, vw, vh);
+        bindTex(0, lutTex); gl.uniform1i(UC.uLUT, 0);
+        bindTex(1, rt.tex[0]); gl.uniform1i(UC.uFieldTex, 1);
+        gl.uniform1f(UC.uFrost, 1);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }),
+    ];
+    // 等待所有查询完成（同步轮询，基准场景下可以接受）
+    const t0 = performance.now();
+    const done = new Array(jobs.length).fill(false);
+    while (done.some(d => !d) && performance.now() - t0 < 4000) {
+      jobs.forEach((j, i) => { if (!done[i]) done[i] = j.wait(); });
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return {
+      res: vw + '×' + vh, megapixels: +(vw * vh / 1e6).toFixed(2), dpr,
+      frost: state.frost,
+      passes: jobs.map(j => ({ label: j.out.label, ms: j.out.ms === undefined ? null : +j.out.ms.toFixed(3) })),
+    };
+  },
+  /* 一键恢复出厂：色阶、调色、动态、质感、基调、画质全部回到默认。
+     用户需要它（调到面目全非之后要能回去），验收也需要它（每条用例都从干净的默认态开始）。 */
+  resetAll() {
+    const keep = { outW: state.outW, outH: state.outH };
+    Object.assign(state, DEFAULTS, keep);
+    /* 玻璃的尺寸/高光：DEFAULTS 里存的是 type 0 的那组数（1.00 / 0.00），
+       所以恢复出厂后要按**当前类型**重刷一次 —— 否则在橘皮下恢复出厂会得到
+       尺寸 1.00（橘皮该是 0.40），滑块和"这种玻璃该有的样子"对不上。
+       syncGlassPreset() 走的是"类型没变就不套"的路径，这里必须显式调。 */
+    applyGlassPreset();
+    swatchOff.fill(0);
+    setRawFromStops(PRESETS[0].stops);
+    setPresetActive('gray');
+    buildBlobs();
+    adapt.down = 0; adapt.cur = 0;
+    canvas.width = 0; canvas.height = 0; resize();
+    syncUI();
+    rebuildLUT();
+    flushSave();
+    return true;
+  },
+  defaults: () => ({ ...DEFAULTS }),
+  flush: () => { flushSave(); return true; },
+  dbg: v => { state._dbg = v; renderDirty = true; },
+};
+window.__gfErrors = [];
+/* 防回归：GF 对象里同名键重复定义会静默覆盖（raw 就被覆盖过一次，
+   表现是"写了参数却完全没生效"，查了很久）。启动时扫一遍。 */
+(function checkDupKeys() {
+  /* 只扫 `const GF = {` 到字面量结束的 `};` 这一段。直接扫整份脚本时，函数体里
+     两格缩进的 `if (` / `for (` 会被下面的键正则误命中 —— 单文件版（内联进
+     <script>）因此满屏误报。外部脚本（<script src>）的 textContent 为空，
+     此时 src 为空、直接跳过（原实现同样从不生效，不改变既有行为）。 */
+  const full = document.currentScript ? document.currentScript.textContent : '';
+  const from = full.indexOf('const GF = {');
+  const end = from >= 0 ? full.indexOf('\n};', from) : -1;
+  const src = end > from ? full.slice(from, end) : '';
+  const seen = new Map();
+  for (const m of src.matchAll(/^\s{2}([A-Za-z_$][\w$]*)\s*[:(]/gm)) {
+    const k = m[1];
+    if (seen.has(k)) window.__gfErrors.push('GF 对象重复键: ' + k);
+    seen.set(k, 1);
+  }
+})();
+addEventListener('error', e => window.__gfErrors.push(String(e.message)));
+addEventListener('unhandledrejection', e => window.__gfErrors.push(String(e.reason)));
