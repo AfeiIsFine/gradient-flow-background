@@ -15,7 +15,7 @@
 
 | 方式 | 怎么做 | 适合 |
 |---|---|---|
-| **单文件版** | 下载 [`gradient-flow.html`](gradient-flow.html)，双击打开 | 发给别人 / 离线用。整个工具就一个文件，180 KB |
+| **单文件版** | 下载 [`gradient-flow.html`](gradient-flow.html)，双击打开 | 发给别人 / 离线用。整个工具就一个文件，约 180 KB |
 | **在线版** | 打开 <https://afeiisfine.github.io/gradient-flow-background/> | 不下载，直接看效果 |
 | **源码版** | `index.html`、`app.js`、`styles.css` 放同一目录，双击 `index.html` | 想改代码 |
 

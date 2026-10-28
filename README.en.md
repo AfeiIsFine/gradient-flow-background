@@ -16,7 +16,7 @@ grain and warp, export stills or image sequences, or export a ready-to-embed bac
 
 | Way | How | Good for |
 |---|---|---|
-| **Single file** | Download [`gradient-flow.html`](gradient-flow.html) and double-click it | Sharing / offline use — the whole tool is one 180 KB file |
+| **Single file** | Download [`gradient-flow.html`](gradient-flow.html) and double-click it | Sharing / offline use — the whole tool is one ~180 KB file |
 | **Online** | Open <https://afeiisfine.github.io/gradient-flow-background/> | No download, just see it |
 | **Source** | Keep `index.html`, `app.js`, `styles.css` in one folder and open `index.html` | Modifying the code |
 
