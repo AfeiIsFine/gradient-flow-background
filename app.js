@@ -42,6 +42,7 @@ const I18N = {
     docTitle: '色彩渐变流动背景',
     appTitleL: '色彩渐变流动背景', appTitleR: '动态 · 输出',
     collapse: '收起', panelChip: '‹ 显示面板 ›', langLabel: '语言 / Language',
+    mobMotion: '动态 ›', mobColor: '‹ 色彩',
     pause: '暂停', play: '播放',
     tCollapse: '收起两侧面板（Tab）', tPause: '空格键播放 / 暂停',
     tFactory: '色带 / 调色 / 动态 / 质感 全部回到出厂默认', tReseed: '重新抽一次构图（换一套随机种子）',
@@ -81,6 +82,7 @@ const I18N = {
     docTitle: 'Gradient Flow',
     appTitleL: 'Gradient Flow', appTitleR: 'Motion · Output',
     collapse: 'Collapse', panelChip: '‹ Show panel ›', langLabel: 'Language',
+    mobMotion: 'Motion ›', mobColor: '‹ Colour',
     pause: 'Pause', play: 'Play',
     tCollapse: 'Collapse both panels (Tab)', tPause: 'Space to play / pause',
     tFactory: 'Reset band / grade / motion / texture to factory defaults', tReseed: 'Draw a new layout (new random seed)',
@@ -1815,16 +1817,28 @@ addEventListener('keydown', e => {
 /* 面板收起 / 展开：一个按钮控两侧（particle-pointcloud 的做法），
    收起后右下角出现一个"面板"chip 唤回。 */
 let uiHidden = false;
+/* 窄屏（手机）：两个面板放不下，同一时刻只显示一个，用头部的 .mob-switch 互切。
+   桌面端完全不受影响：按钮被 CSS 隐藏，mobOff 也只在窄屏的媒体查询里才有定义。 */
+const isNarrow = () => matchMedia('(max-width: 900px)').matches;
+function mobShow(which) {
+  if (!isNarrow()) return;
+  $('panelL').classList.toggle('mobOff', which === 'R');
+  $('panelR').classList.toggle('mobOff', which === 'L');
+}
+
 function setPanelsHidden(hidden) {
   uiHidden = hidden;
   $('panelL').classList.toggle('collapsed', hidden);
   $('panelR').classList.toggle('collapsed', hidden);
   $('toggleBtn').classList.toggle('show', hidden);
+  if (!hidden && isNarrow()) mobShow('L');   /* 窄屏展开时先给色彩面板 */
   syncMini();
 }
 const panelsHidden = () => $('panelL').classList.contains('collapsed');
 $('collapseAll').addEventListener('click', () => setPanelsHidden(true));
 $('toggleBtn').addEventListener('click', () => setPanelsHidden(false));
+$('mobNext').addEventListener('click', () => mobShow('R'));
+$('mobPrev').addEventListener('click', () => mobShow('L'));
 
 function syncMini() {
   $('hud').classList.toggle('on', panelsHidden());   // HUD 只在收起面板时显示
@@ -2405,6 +2419,8 @@ function boot() {
   /* 面板玻璃浓度：先把保守值（最实）写上去，首帧取样后再按底亮度放开 */
   applyPanelA();
   setPaused(state.paused);
+  /* 手机上先给画面：默认收起两侧面板，点右下角「显示面板」再展开 */
+  if (isNarrow()) setPanelsHidden(true);
   const rt = $('recTxt'); if (rt) rt.textContent = recTextNow();
 
   rebuildLUT();
